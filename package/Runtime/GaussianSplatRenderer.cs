@@ -2,8 +2,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using GaussianSplatting.Runtime.Modifier;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
@@ -212,7 +210,6 @@ namespace GaussianSplatting.Runtime
                 // MaterialPropertyBlock 설정
                 mpb.Clear();
                 renderer.SetAssetDataOnMaterial(mpb);
-                renderer.ApplyModifierMaterialProperties(mpb, cam); // 모디파이어의 머티리얼 프로퍼티 적용
                 
                 // 가우시안 청크 및 정렬 키, 뷰 데이터 GPU 버퍼 설정
                 mpb.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, renderer.GpuChunksBuffer); // 프로퍼티로 접근
@@ -364,9 +361,6 @@ namespace GaussianSplatting.Runtime
         [Range(1, 30)]
         [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;
-        [Range(0f, 1f)]
-        [Tooltip("Grayscale 모드에서 적용할 투명도")]
-        public float m_GrayAlpha = 1f;
 
         public RenderMode m_RenderMode = RenderMode.Splats;
         [Range(1.0f, 15.0f)] public float m_PointDisplaySize = 3.0f;
@@ -380,12 +374,6 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Gaussian splatting compute shader")]
         public ComputeShader m_CSSplatUtilities;
         
-        List<IGaussianSplatModifier> m_Modifiers = new List<IGaussianSplatModifier>();
-        // GC 최적화를 위해 활성화된 모디파이어만 담을 임시 리스트
-        private List<IGaussianSplatModifier> m_ActiveModifiersScratchList = new List<IGaussianSplatModifier>();
-
-        [NonSerialized]
-        private bool m_ForceModifierRefresh = true; // 에디터에서 모디파이어 리스트 갱신 필요 여부
 
         int m_SplatCount; // initially same as asset splat count, but editing can change this
         GraphicsBuffer m_GpuSortDistances;
@@ -393,8 +381,7 @@ namespace GaussianSplatting.Runtime
         internal GraphicsBuffer m_GpuPosData;
         internal GraphicsBuffer m_GpuOtherData;
         internal GraphicsBuffer m_GpuSHData;
-        internal RenderTexture m_GpuColorData; // Texture에서 RenderTexture로 변경
-        RenderTexture m_GpuOriginalColorData; // 원본 컬러 데이터를 보관하는 텍스처
+        internal Texture m_GpuColorData;
         internal GraphicsBuffer m_GpuChunks;
         public bool m_GpuChunksValid;
         internal GraphicsBuffer m_GpuView;
@@ -426,7 +413,7 @@ namespace GaussianSplatting.Runtime
         public GraphicsBuffer GpuPosData => m_GpuPosData;
         public GraphicsBuffer GpuOtherData => m_GpuOtherData;
         public GraphicsBuffer GpuSHData => m_GpuSHData;
-        public RenderTexture GpuColorTexture => m_GpuColorData; // 이름 변경 및 타입 명시
+        public Texture GpuColorTexture => m_GpuColorData;
         public GraphicsBuffer GpuViewBuffer => m_GpuView;
         public GraphicsBuffer GpuChunksBuffer => m_GpuChunks;
         public ComputeShader CSSplatUtilities => m_CSSplatUtilities;
@@ -434,7 +421,7 @@ namespace GaussianSplatting.Runtime
 
         static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
 
-        public static class Props
+        internal static class Props
         {
             public static readonly int SplatPos = Shader.PropertyToID("_SplatPos");
             public static readonly int SplatOther = Shader.PropertyToID("_SplatOther");
@@ -536,52 +523,11 @@ namespace GaussianSplatting.Runtime
 
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
-            
-            if (m_GpuColorData != null && (m_GpuColorData.width != texWidth || m_GpuColorData.height != texHeight || m_GpuColorData.graphicsFormat != texFormat))
-            {
-                DestroyImmediate(m_GpuColorData);
-                m_GpuColorData = null;
-            }
-            if (m_GpuColorData == null)
-            {
-                var colorDesc = new RenderTextureDescriptor(texWidth, texHeight, texFormat, 0)
-                {
-                    enableRandomWrite = true, // 쓰기 가능하도록 설정
-                    autoGenerateMips = false,
-                    useMipMap = false,
-                    sRGB = (texFormat == GraphicsFormat.R8G8B8A8_SRGB || texFormat == GraphicsFormat.R8G8B8A8_UNorm || texFormat == GraphicsFormat.RGBA_BC7_SRGB || texFormat == GraphicsFormat.RGBA_BC7_UNorm) // SRGB 포맷인 경우 명시
-                };
-                m_GpuColorData = new RenderTexture(colorDesc) { name = "GaussianColorData_RT" };
-                m_GpuColorData.Create();
-            }
-            
-            // m_GpuOriginalColorData 생성 및 원본 데이터 로드
-            if (m_GpuOriginalColorData != null && (m_GpuOriginalColorData.width != texWidth || m_GpuOriginalColorData.height != texHeight || m_GpuOriginalColorData.graphicsFormat != texFormat))
-            {
-                DestroyImmediate(m_GpuOriginalColorData);
-                m_GpuOriginalColorData = null;
-            }
-            if (m_GpuOriginalColorData == null)
-            {
-                // OriginalColorData는 Compute Shader에서 직접 쓰이지 않으므로 enableRandomWrite = false 가능
-                var originalColorDesc = new RenderTextureDescriptor(texWidth, texHeight, texFormat, 0)
-                {
-                    enableRandomWrite = false, // 읽기 전용으로 사용될 수 있음
-                    autoGenerateMips = false,
-                    useMipMap = false,
-                    sRGB = (texFormat == GraphicsFormat.R8G8B8A8_SRGB || texFormat == GraphicsFormat.R8G8B8A8_UNorm || texFormat == GraphicsFormat.RGBA_BC7_SRGB || texFormat == GraphicsFormat.RGBA_BC7_UNorm)
-                };
-                m_GpuOriginalColorData = new RenderTexture(originalColorDesc) { name = "GaussianColorData_RT_Original" };
-                m_GpuOriginalColorData.Create();
-            }
-
-            // 임시 Texture2D를 사용하여 데이터 로드 및 RenderTexture로 복사
-            var tempTex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData_TempLoad" };
-            tempTex.SetPixelData(asset.colorData.GetData<byte>(), 0);
-            tempTex.Apply(false, false); 
-            Graphics.CopyTexture(tempTex, m_GpuOriginalColorData); // 원본 텍스처에 복사
-            // Graphics.CopyTexture(tempTex, m_GpuColorData); // 아래 CalcViewData에서 어차피 복사함
-            DestroyImmediate(tempTex);
+            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
+            tex.SetPixelData(asset.colorData.GetData<byte>(), 0);
+            tex.Apply(false, true);
+            DestroyImmediate(m_GpuColorData);
+            m_GpuColorData = tex;
 
             if (asset.chunkData != null && asset.chunkData.dataSize != 0)
             {
@@ -681,8 +627,6 @@ namespace GaussianSplatting.Runtime
 
             // CreateResourcesForAsset(); // Update에서 처리하도록 변경 (해시 비교 후)
             
-            RefreshModifiersList(true); // true는 기존 모디파이어도 강제 재초기화
-            m_ForceModifierRefresh = false;
         }
 
         public void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
@@ -733,16 +677,8 @@ namespace GaussianSplatting.Runtime
 
         void DisposeResourcesForAsset()
         {
-            if (m_GpuColorData) // RenderTexture는 DestroyImmediate 사용
-            {
-                DestroyImmediate(m_GpuColorData);
-                m_GpuColorData = null;
-            }
-            if (m_GpuOriginalColorData) // 원본 컬러 데이터도 해제
-            {
-                DestroyImmediate(m_GpuOriginalColorData);
-                m_GpuOriginalColorData = null;
-            }
+            DestroyImmediate(m_GpuColorData);
+            m_GpuColorData = null;
 
             DisposeBuffer(ref m_GpuPosData);
             DisposeBuffer(ref m_GpuOtherData);
@@ -777,20 +713,6 @@ namespace GaussianSplatting.Runtime
 
         public void OnDisable()
         {
-            // 모디파이어 해제
-            if (m_Modifiers != null)
-            {
-                // 리스트를 복사하여 순회 (OnShutdown에서 m_Modifiers가 변경될 가능성 대비)
-                var toShutdown = new List<IGaussianSplatModifier>(m_Modifiers);
-                foreach (var modifier in m_Modifiers.Where(modifier => modifier != null))
-                {
-                    modifier.ReleaseResources();
-                    modifier.OnShutdown(this);
-                }
-                m_Modifiers.Clear();
-            }
-            m_ActiveModifiersScratchList.Clear();
-            
             DisposeResourcesForAsset();
             if (GaussianSplatRenderSystem.instance != null) // 인스턴스 null 체크 추가
             {
@@ -809,23 +731,8 @@ namespace GaussianSplatting.Runtime
             if (cam.cameraType == CameraType.Preview)
                 return;
 
-#if UNITY_EDITOR
-            if (!Application.isPlaying && m_ForceModifierRefresh) {
-                RefreshModifiersList(true);
-                m_ForceModifierRefresh = false;
-            }
-#endif
-
-            // --- 매 프레임 m_GpuColorData를 원본으로 복원 ---
-            if (m_GpuOriginalColorData != null && m_GpuColorData != null)
-            {
-                cmb.CopyTexture(m_GpuOriginalColorData, m_GpuColorData);
-            }
-            // --- 원본 복원 끝 ---
-            
-            // 기본 데이터 및 포맷 정보를 Compute Shader에 바인딩 (모든 모디파이어가 접근 가능하도록 먼저 설정)
-            SetAssetDataOnCS(cmb, KernelIndices.CalcViewData);  // 이 함수는 _SplatColor (읽기용)를 바인딩할 수 있음.
-                                                                // AngleBasedColorModifier는 _SplatColorRW를 사용하므로 충돌 없음.
+            // 기본 데이터 및 포맷 정보를 Compute Shader에 바인딩
+            SetAssetDataOnCS(cmb, KernelIndices.CalcViewData);
 
             // --- 유니폼 기본값 설정 ---
             if (m_CSSplatUtilities != null)
@@ -837,40 +744,6 @@ namespace GaussianSplatting.Runtime
                 cmb.SetComputeFloatParam(m_CSSplatUtilities, exposureID, 1.0f);
             }
             // --- 유니폼 기본값 설정 끝 ---
-
-            m_ActiveModifiersScratchList.Clear(); // 임시 리스트 초기화
-            if (m_Modifiers != null)
-            {
-                foreach (var modAsInterface in m_Modifiers)
-                {
-                    if (modAsInterface == null) continue;
-
-                    MonoBehaviour monoMod = modAsInterface as MonoBehaviour;
-                    if (monoMod == null || !monoMod.enabled) continue; // Unity 컴포넌트 비활성화 체크
-
-                    bool modifierLogicActive = true; // 기본적으로 활성화로 간주
-                    if (modAsInterface is BaseGaussianSplatModifier baseMod)
-                    {
-                        modifierLogicActive = baseMod.IsModifierActive; // 커스텀 활성화 변수 체크
-                    }
-                    // BaseGaussianSplatModifier를 상속하지 않은 IGaussianSplatModifier는 IsModifierActive가 없으므로,
-                    // MonoBehaviour.enabled 만으로 판단하거나, 항상 활성으로 간주할 수 있습니다.
-                    // 위 로직은 BaseGaussianSplatModifier가 아니면 modifierLogicActive가 true로 유지됩니다.
-
-                    if (modifierLogicActive)
-                    {
-                        m_ActiveModifiersScratchList.Add(modAsInterface);
-                    }
-                }
-            }
-
-            if (m_ActiveModifiersScratchList.Count > 0 && HasValidAsset && HasValidRenderSetup)
-            {
-                foreach (var modifier in m_ActiveModifiersScratchList)
-                {
-                    modifier.ExecuteGPUModifications(cmb, this, cam);
-                }
-            }
 
             var tr = transform;
 
@@ -927,57 +800,9 @@ namespace GaussianSplatting.Runtime
             cmd.EndSample(s_ProfSort);
         }
         
-        // 모디파이어 MaterialPropertyBlock 적용 메서드 (GaussianSplatRenderSystem에서 호출됨)
-        public void ApplyModifierMaterialProperties(MaterialPropertyBlock mpb, Camera cam)
-        {
-#if UNITY_EDITOR
-            if (!Application.isPlaying && m_ForceModifierRefresh) {
-                RefreshModifiersList(true);
-                m_ForceModifierRefresh = false;
-            }
-#endif
-            m_ActiveModifiersScratchList.Clear(); // 임시 리스트 초기화
-            if (m_Modifiers != null)
-            {
-                foreach (var modAsInterface in m_Modifiers)
-                {
-                    if (modAsInterface == null) continue;
-                    MonoBehaviour monoMod = modAsInterface as MonoBehaviour;
-                    if (monoMod == null || !monoMod.enabled) continue;
-
-                    bool modifierLogicActive = true;
-                    if (modAsInterface is BaseGaussianSplatModifier baseMod)
-                    {
-                        modifierLogicActive = baseMod.IsModifierActive;
-                    }
-                
-                    if (modifierLogicActive)
-                    {
-                        m_ActiveModifiersScratchList.Add(modAsInterface);
-                    }
-                }
-            }
-        
-            if (m_ActiveModifiersScratchList.Count > 0 && HasValidAsset && HasValidRenderSetup)
-            {
-                foreach (var modifier in m_ActiveModifiersScratchList)
-                {
-                    modifier.SetMaterialProperties(mpb, this, cam);
-                }
-            }
-        }
 
         public void Update()
-        {
-#if UNITY_EDITOR
-            // 에디터에서 플레이 중이 아닐 때, Hierarchy 변경 등으로 모디파이어 리스트가 바뀔 수 있음
-            if (!Application.isPlaying && m_ForceModifierRefresh)
-            {
-                RefreshModifiersList(true); // 변경 감지 시 강제 초기화 포함 갱신
-                m_ForceModifierRefresh = false;
-            }
-#endif
-            
+        {            
             var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
             if (m_PrevAsset != m_Asset || m_PrevHash != curHash)
             {
@@ -987,8 +812,6 @@ namespace GaussianSplatting.Runtime
                 {
                     DisposeResourcesForAsset();
                     CreateResourcesForAsset();
-                    
-                    RefreshModifiersList(true); // Asset 변경 시 모든 모디파이어 강제 재초기화
                 }
                 else
                 {
@@ -997,84 +820,7 @@ namespace GaussianSplatting.Runtime
             }
         }
 
-#if UNITY_EDITOR
-    void OnValidate()
-    {
-        if (gameObject.activeInHierarchy && enabled)
-        {
-            // OnValidate는 매우 자주 호출될 수 있으므로, 실제 변경을 감지하는 더 정교한 로직이 필요할 수 있음
-            // 여기서는 단순하게 플래그만 설정
-            UnityEditor.EditorApplication.delayCall += () => {
-                if (this != null && gameObject != null) //객체 파괴 확인
-                {
-                    m_ForceModifierRefresh = true;
-                }
-            };
-        }
-    }
 
-    void OnTransformChildrenChanged()
-    {
-        if (gameObject.activeInHierarchy && enabled)
-        {
-             UnityEditor.EditorApplication.delayCall += () => {
-                if (this != null && gameObject != null)
-                {
-                    m_ForceModifierRefresh = true;
-                }
-            };
-        }
-    }
-#endif
-
-    private void RefreshModifiersList(bool forceReinitializeExisting)
-    {
-        bool canInitializeModifiers = HasValidAsset && HasValidRenderSetup;
-
-        List<IGaussianSplatModifier> foundModifiers = new List<IGaussianSplatModifier>();
-        // 자식 객체 및 비활성화된 컴포넌트도 일단 모두 가져옵니다.
-        // 실제 사용 여부는 Execute/SetProperties 시점에 MonoBehaviour.enabled와 IsModifierActive로 결정합니다.
-        GetComponentsInChildren<IGaussianSplatModifier>(true, foundModifiers);
-
-        // 1. 제거된 모디파이어 처리 (m_Modifiers에 있지만 foundModifiers에는 없는 경우)
-        for (int i = m_Modifiers.Count - 1; i >= 0; i--)
-        {
-            var existingModifier = m_Modifiers[i];
-            // (existingModifier as MonoBehaviour) == null 체크는 Unity에서 Destroy된 객체를 확인하는 일반적인 방법입니다.
-            if (existingModifier == null || (existingModifier as MonoBehaviour) == null || !foundModifiers.Contains(existingModifier))
-            {
-                if (existingModifier != null) // 아직 Shutdown되지 않았다면
-                {
-                    existingModifier.ReleaseResources();
-                    existingModifier.OnShutdown(this);
-                }
-                m_Modifiers.RemoveAt(i);
-            }
-        }
-
-        // 2. 새로 추가된 모디파이어 및 기존 모디파이어 상태 갱신
-        foreach (var foundModifier in foundModifiers)
-        {
-            if (foundModifier == null || (foundModifier as MonoBehaviour) == null) continue;
-
-            bool isNew = !m_Modifiers.Contains(foundModifier);
-            if (isNew)
-            {
-                m_Modifiers.Add(foundModifier);
-            }
-
-            // 새로 추가되었거나, 강제 재초기화가 필요하거나, Asset이 준비되었는데 아직 초기화 안된 경우
-            // 그리고 해당 모디파이어의 GameObject와 Component가 모두 활성화된 경우
-            MonoBehaviour monoMod = foundModifier as MonoBehaviour;
-            bool shouldInitialize = monoMod != null && monoMod.isActiveAndEnabled; // GameObject 활성화 + Component 활성화
-
-            if (canInitializeModifiers && shouldInitialize && (isNew || forceReinitializeExisting))
-            {
-                foundModifier.OnInitialize(m_Asset, this);
-                foundModifier.SetupResources(this);
-            }
-        }
-    }
 
         public void ActivateCamera(int index)
         {
@@ -1400,7 +1146,7 @@ namespace GaussianSplatting.Runtime
             var newOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, newSplatCount * otherStride / 4, 4) { name = "GaussianOtherData" };
             var newSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, newSplatCount * shStride / 4, 4) { name = "GaussianSHData" };
 
-            // new texture is a RenderTexture so we can write to it from a compute shader
+            // new texture is a RenderTexture so we can write to it from a compute shader (editing only)
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(newSplatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
             var newColorData = new RenderTexture(texWidth, texHeight, texFormat, GraphicsFormat.None) { name = "GaussianColorData", enableRandomWrite = true };
