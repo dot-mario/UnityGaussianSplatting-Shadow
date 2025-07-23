@@ -2,6 +2,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using GaussianSplatting.Runtime.Modifier;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
@@ -14,39 +16,96 @@ using UnityEngine.XR;
 
 namespace GaussianSplatting.Runtime
 {
+    /// <summary>
+    /// GaussianSplatRenderSystem:
+    /// 여러 GaussianSplatRenderer 인스턴스를 중앙에서 관리하여,
+    /// 카메라의 PreCull 단계에 삽입된 CommandBuffer를 통해
+    /// 대규모 Gaussian Splat(점 기반 입자) 데이터를 효율적으로 렌더링합니다.
+    /// 
+    /// 주요 워크플로우:
+    /// 1. RegisterSplat: 렌더링 대상에 splat 등록
+    /// 2. OnPreCullCamera: 카메라 프리컬 이벤트 핸들러
+    ///    a. GatherSplatsForCamera -> 활성 splat 수집 및 정렬
+    ///    b. InitialClearCmdBuffer -> CommandBuffer 초기화 및 RT 세팅
+    ///    c. SortAndRenderSplats -> GPU로 정렬 및 렌더링 명령 구성
+    ///    d. Composite -> 최종 합성(블렌딩) 수행
+    /// 
+    /// 성능 고려:
+    /// - SortPoints 호출 빈도 조절(m_SortNthFrame)
+    /// - MaterialPropertyBlock 재사용으로 GC 최소화
+    /// - GetTemporaryRT 사용 후 ReleaseTemporaryRT로 메모리 해제
+    /// 
+    /// 수학/알고리즘:
+    /// - z값 기준 깊이 정렬: 카메라 좌표계의 z축 좌표로 정렬하여 오버랩 처리
+    /// - RendererOrder 우선순위 적용: order 값이 클수록 나중(위)에 렌더링
+    /// - GPU 인스턴싱: DrawProcedural로 다수 인스턴스 렌더링
+    /// </summary>
     class GaussianSplatRenderSystem
     {
-        // ReSharper disable MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
-        internal static readonly ProfilerMarker s_ProfDraw = new(ProfilerCategory.Render, "GaussianSplat.Draw", MarkerFlags.SampleGPU);
-        internal static readonly ProfilerMarker s_ProfCompose = new(ProfilerCategory.Render, "GaussianSplat.Compose", MarkerFlags.SampleGPU);
+        // =========================================
+        // ProfilerMarker 정의 (GPU 샘플링 포함)
+        // =========================================
+        // s_ProfDraw: DrawProcedural 명령 부하 측정
+        internal static readonly ProfilerMarker s_ProfDraw     = new(ProfilerCategory.Render, "GaussianSplat.Draw",     MarkerFlags.SampleGPU);
+        // s_ProfCompose: 합성(Compose) 단계 부하 측정
+        internal static readonly ProfilerMarker s_ProfCompose  = new(ProfilerCategory.Render, "GaussianSplat.Compose",  MarkerFlags.SampleGPU);
+        // s_ProfCalcView: 뷰 데이터 계산(CalcViewData) 부하 측정
         internal static readonly ProfilerMarker s_ProfCalcView = new(ProfilerCategory.Render, "GaussianSplat.CalcView", MarkerFlags.SampleGPU);
-        // ReSharper restore MemberCanBePrivate.Global
 
+        // 싱글톤 인스턴스 (지연 초기화)
         public static GaussianSplatRenderSystem instance => ms_Instance ??= new GaussianSplatRenderSystem();
         static GaussianSplatRenderSystem ms_Instance;
 
+        // =========================================
+        // 내부 상태: splat 객체 매핑 및 CommandBuffer 관리
+        // =========================================
+        // m_Splats: GaussianSplatRenderer -> MaterialPropertyBlock 매핑
+        //  - MaterialPropertyBlock: GPU 셰이더 변수 전달을 위한 구조체,
+        //    매 프레임 할당 없이 재사용 가능 (GC 부담 완화)
         readonly Dictionary<GaussianSplatRenderer, MaterialPropertyBlock> m_Splats = new();
-        readonly HashSet<Camera> m_CameraCommandBuffersDone = new();
-        readonly List<(GaussianSplatRenderer, MaterialPropertyBlock)> m_ActiveSplats = new();
 
+        // 이미 CommandBuffer가 추가된 카메라 집합 (중복 추가 방지)
+        readonly HashSet<Camera> m_CameraCommandBuffersDone = new();
+
+        // 현재 카메라 프레임에 활성화된 splat 리스트 (튜플: Renderer, MPB)
+        readonly List<(GaussianSplatRenderer renderer, MaterialPropertyBlock mpb)> m_ActiveSplats = new();
+
+        // 재사용 가능한 CommandBuffer 인스턴스
         CommandBuffer m_CommandBuffer;
 
+        // =========================================
+        // Public API: splat 등록 및 해제
+        // =========================================
+        /// <summary>
+        /// GaussianSplatRenderer를 렌더링 시스템에 등록.
+        /// 첫 등록 시 카메라 PreCull 이벤트 핸들러 등록.
+        /// </summary>
+        /// <param name="r">대상 GaussianSplatRenderer 인스턴스</param>
         public void RegisterSplat(GaussianSplatRenderer r)
         {
+            // 최초 splat 등록 시 PreCull 이벤트에 핸들러 추가
             if (m_Splats.Count == 0)
             {
+                // URP/HDRP 등 스크립터블 렌더 파이프라인이 아니라면
                 if (GraphicsSettings.currentRenderPipeline == null)
                     Camera.onPreCull += OnPreCullCamera;
             }
-
-            m_Splats.Add(r, new MaterialPropertyBlock());
+            // MaterialPropertyBlock 생성 및 매핑
+            if (!m_Splats.ContainsKey(r)) // 중복 등록 방지
+                m_Splats.Add(r, new MaterialPropertyBlock());
         }
 
+        /// <summary>
+        /// 등록된 splat 해제.
+        /// 최종 해제 시 이벤트 핸들러 제거 및 CommandBuffer 정리.
+        /// </summary>
+        /// <param name="r">해제할 GaussianSplatRenderer</param>
         public void UnregisterSplat(GaussianSplatRenderer r)
         {
-            if (!m_Splats.ContainsKey(r))
-                return;
-            m_Splats.Remove(r);
+            if (!m_Splats.Remove(r))
+                return; // 등록되어 있지 않으면 무시
+
+            // 더 이상 렌더링 대상이 없을 때 클린업
             if (m_Splats.Count == 0)
             {
                 if (m_CameraCommandBuffersDone != null)
@@ -54,159 +113,224 @@ namespace GaussianSplatting.Runtime
                     if (m_CommandBuffer != null)
                     {
                         foreach (var cam in m_CameraCommandBuffersDone)
-                        {
-                            if (cam)
-                                cam.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, m_CommandBuffer);
-                        }
+                            if (cam) cam.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, m_CommandBuffer);
                     }
                     m_CameraCommandBuffersDone.Clear();
                 }
-
+                
                 m_ActiveSplats.Clear();
                 m_CommandBuffer?.Dispose();
                 m_CommandBuffer = null;
-                Camera.onPreCull -= OnPreCullCamera;
+
+                // PreCull 이벤트 핸들러 해제
+                if (GraphicsSettings.currentRenderPipeline == null) // Built-in RP
+                    Camera.onPreCull -= OnPreCullCamera;
             }
         }
 
-        // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
+        // =========================================
+        // 렌더링 워크플로우 단계 1: splat 수집 및 정렬
+        // =========================================
+        /// <summary>
+        /// 활성화된 splat 객체를 필터링하고, 렌더 순서 및 카메라-깊이 기준으로 정렬합니다.
+        /// </summary>
+        /// <param name="cam">현재 렌더링 중인 Camera</param>
+        /// <returns>활성 splat이 있으면 true</returns>
         public bool GatherSplatsForCamera(Camera cam)
         {
+            // 에디터 미리보기 카메라는 스킵
             if (cam.cameraType == CameraType.Preview)
                 return false;
-            // gather all active & valid splat objects
+
             m_ActiveSplats.Clear();
+            // 등록된 모든 splat 검사
             foreach (var kvp in m_Splats)
             {
                 var gs = kvp.Key;
+                // 유효성 검사: null, 활성화 상태, 에셋/렌더 세팅 합법 여부
                 if (gs == null || !gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup)
                     continue;
-                m_ActiveSplats.Add((kvp.Key, kvp.Value));
+                m_ActiveSplats.Add((gs, kvp.Value));
             }
             if (m_ActiveSplats.Count == 0)
                 return false;
 
-            // sort them by order and depth from camera
-            var camTr = cam.transform;
+            // 카메라의 로컬 좌표계(Z depth) 및 사용자 지정 렌더 순서로 정렬
+            var camTransform = cam.transform;
             m_ActiveSplats.Sort((a, b) =>
             {
-                var orderA = a.Item1.m_RenderOrder;
-                var orderB = b.Item1.m_RenderOrder;
-                if (orderA != orderB)
-                    return orderB.CompareTo(orderA);
-                var trA = a.Item1.transform;
-                var trB = b.Item1.transform;
-                var posA = camTr.InverseTransformPoint(trA.position);
-                var posB = camTr.InverseTransformPoint(trB.position);
-                return posA.z.CompareTo(posB.z);
+                // 1) m_RenderOrder 값 내림차순 (높은 값이 나중에 렌더)
+                int orderCompare = b.renderer.m_RenderOrder.CompareTo(a.renderer.m_RenderOrder);
+                if (orderCompare != 0) return orderCompare;
+
+                // 2) 카메라 로컬 Z 오름차순 (작을수록 가까움)
+                float zA = camTransform.InverseTransformPoint(a.renderer.transform.position).z;
+                float zB = camTransform.InverseTransformPoint(b.renderer.transform.position).z;
+                return zA.CompareTo(zB);
             });
 
             return true;
         }
 
-        // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
+        // =========================================
+        // 렌더링 워크플로우 단계 2: 정렬된 splat 렌더링 구성
+        // =========================================
+        /// <summary>
+        /// GatherSplatsForCamera 이후에 호출되어,
+        /// 각 splat의 GPU 버퍼, 셰이더 매개변수를 설정하고
+        /// DrawProcedural 명령을 CommandBuffer에 추가합니다.
+        /// </summary>
+        /// <param name="cam">현재 카메라</param>
+        /// <param name="cmb">활용할 CommandBuffer</param>
+        /// <returns>Composite 단계용 머티리얼</returns>
         public Material SortAndRenderSplats(Camera cam, CommandBuffer cmb)
         {
-            Material matComposite = null;
-            foreach (var kvp in m_ActiveSplats)
+            Material compositeMat = null;
+
+            foreach (var (renderer, mpb) in m_ActiveSplats)
             {
-                var gs = kvp.Item1;
-                gs.EnsureMaterials();
-                matComposite = gs.m_MatComposite;
-                var mpb = kvp.Item2;
+                // 셰이더와 머티리얼 초기화
+                renderer.EnsureMaterials();
+                compositeMat = renderer.m_MatComposite;
 
-                // sort
-                var matrix = gs.transform.localToWorldMatrix;
-                if (gs.m_FrameCounter % gs.m_SortNthFrame == 0)
-                    gs.SortPoints(cmb, cam, matrix);
-                ++gs.m_FrameCounter;
-
-                // cache view
-                kvp.Item2.Clear();
-                Material displayMat = gs.m_RenderMode switch
+                // 디버그 모드에 따른 머티리얼 분기
+                Material drawMat = renderer.m_RenderMode switch
                 {
-                    GaussianSplatRenderer.RenderMode.DebugPoints => gs.m_MatDebugPoints,
-                    GaussianSplatRenderer.RenderMode.DebugPointIndices => gs.m_MatDebugPoints,
-                    GaussianSplatRenderer.RenderMode.DebugBoxes => gs.m_MatDebugBoxes,
-                    GaussianSplatRenderer.RenderMode.DebugChunkBounds => gs.m_MatDebugBoxes,
-                    _ => gs.m_MatSplats
+                    GaussianSplatRenderer.RenderMode.DebugPoints       => renderer.m_MatDebugPoints,
+                    GaussianSplatRenderer.RenderMode.DebugPointIndices => renderer.m_MatDebugPoints,
+                    GaussianSplatRenderer.RenderMode.DebugBoxes        => renderer.m_MatDebugBoxes,
+                    GaussianSplatRenderer.RenderMode.DebugChunkBounds  => renderer.m_MatDebugBoxes,
+                    _                                                 => renderer.m_MatSplats
                 };
-                if (displayMat == null)
-                    continue;
+                if (drawMat == null) continue; // 처리 대상 없으면 스킵
 
-                gs.SetAssetDataOnMaterial(mpb);
-                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, gs.m_GpuChunks);
+                // 프레임 카운터 기반으로 SortPoints 호출 빈도 제어
+                if (renderer.m_FrameCounter % renderer.m_SortNthFrame == 0)
+                    renderer.SortPoints(cmb, cam, renderer.transform.localToWorldMatrix);
+                renderer.m_FrameCounter++;
 
-                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
+                // MaterialPropertyBlock 설정
+                mpb.Clear();
+                renderer.SetAssetDataOnMaterial(mpb);
+                renderer.ApplyModifierMaterialProperties(mpb, cam); // 모디파이어의 머티리얼 프로퍼티 적용
+                
+                // 가우시안 청크 및 정렬 키, 뷰 데이터 GPU 버퍼 설정
+                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, renderer.GpuChunksBuffer); // 프로퍼티로 접근
+                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, renderer.GpuViewBuffer); // 프로퍼티로 접근
+                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer,   renderer.m_GpuSortKeys);
 
-                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
-                mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
-                mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
-                mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
-                mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
-                mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
-                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
-                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
+                // 사용자 조절 가능한 파라미터 세팅 (크기, 투명도 등)
+                mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale,      renderer.m_SplatScale);
+                mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale,renderer.m_OpacityScale);
+                mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize,       renderer.m_PointDisplaySize);
+                mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder,       renderer.m_SHOrder);
+                mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly,        renderer.m_SHOnly ? 1 : 0);
+                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex,  renderer.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
+                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, renderer.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
 
+                // 뷰 데이터 계산: 카메라 좌표계로의 변환, 투영 등
                 cmb.BeginSample(s_ProfCalcView);
-                gs.CalcViewData(cmb, cam);
+                renderer.CalcViewData(cmb, cam);
                 cmb.EndSample(s_ProfCalcView);
 
-                // draw
-                int indexCount = 6;
-                int instanceCount = gs.splatCount;
-                MeshTopology topology = MeshTopology.Triangles;
-                if (gs.m_RenderMode is GaussianSplatRenderer.RenderMode.DebugBoxes or GaussianSplatRenderer.RenderMode.DebugChunkBounds)
-                    indexCount = 36;
-                if (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds)
-                    instanceCount = gs.m_GpuChunksValid ? gs.m_GpuChunks.count : 0;
-
+                // DrawProcedural를 통해 GPU 인스턴싱 렌더링 수행
                 cmb.BeginSample(s_ProfDraw);
-                cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, indexCount, instanceCount, mpb);
+                cmb.DrawProcedural(
+                    renderer.m_GpuIndexBuffer,
+                    renderer.transform.localToWorldMatrix,
+                    drawMat,
+                    0,
+                    MeshTopology.Triangles,
+                    // 기본 quad: 6 인덱스 (2 삼각형)
+                    indexCount: renderer.m_RenderMode is GaussianSplatRenderer.RenderMode.DebugBoxes or GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 36 : 6,
+                    instanceCount: renderer.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? (renderer.m_GpuChunksValid ? renderer.m_GpuChunks.count : 0) : renderer.splatCount,
+                    properties: mpb);
                 cmb.EndSample(s_ProfDraw);
             }
-            return matComposite;
+
+            return compositeMat;
         }
 
-        // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
-        // ReSharper disable once UnusedMethodReturnValue.Global - used by HDRP/URP features that are not always compiled
+        // =========================================
+        // 렌더링 워크플로우 단계 3: CommandBuffer 초기화 및 RT 설정
+        // =========================================
+        /// <summary>
+        /// 카메라별로 단일 CommandBuffer를 생성/추가/재사용하고,
+        /// 커맨드를 클리어하여 준비 상태로 만듭니다.
+        /// </summary>
+        /// <param name="cam">명령을 추가할 Camera</param>
         public CommandBuffer InitialClearCmdBuffer(Camera cam)
         {
-            m_CommandBuffer ??= new CommandBuffer {name = "RenderGaussianSplats"};
+            // CommandBuffer가 없으면 생성
+            if (m_CommandBuffer == null)
+                m_CommandBuffer = new CommandBuffer { name = "RenderGaussianSplats" };
+
+            // BIRP(기본 렌더파이프라인)일 때만, 카메라마다 한 번 추가
             if (GraphicsSettings.currentRenderPipeline == null && cam != null && !m_CameraCommandBuffersDone.Contains(cam))
             {
                 cam.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, m_CommandBuffer);
                 m_CameraCommandBuffersDone.Add(cam);
             }
 
-            // get render target for all splats
+            // 이전 프레임 커맨드 제거
             m_CommandBuffer.Clear();
             return m_CommandBuffer;
         }
 
+        // =========================================
+        // 카메라 PreCull 이벤트 핸들러: 전체 워크플로우 실행
+        // =========================================
         void OnPreCullCamera(Camera cam)
         {
+            // 1) 유효 splat 수집/정렬
             if (!GatherSplatsForCamera(cam))
                 return;
 
+            // 2) CommandBuffer 초기화
             InitialClearCmdBuffer(cam);
 
-            m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT, -1, -1, 0, FilterMode.Point, GraphicsFormat.R16G16B16A16_SFloat);
+            // 3) 임시 RenderTexture 생성 (고정 크기: 화면 해상도)
+            // 임시 RenderTexture 생성 (화면 해상도에 맞춤)
+            m_CommandBuffer.GetTemporaryRT(
+                GaussianSplatRenderer.Props.GaussianSplatRT,
+                -1, -1,           // width, height: -1을 사용하면 현재 활성 렌더 타겟 해상도 사용
+                0,                // depthBuffer: 깊이 버퍼 비활성화
+                FilterMode.Point, // 필터 모드: Point (nearest)
+                GraphicsFormat.R16G16B16A16_SFloat  // 고정소수점 16비트 RGBA
+            );
+            // RenderTexture를 현재 활성 렌더 타겟으로 설정 후 클리어
             m_CommandBuffer.SetRenderTarget(GaussianSplatRenderer.Props.GaussianSplatRT, BuiltinRenderTextureType.CurrentActive);
-            m_CommandBuffer.ClearRenderTarget(RTClearFlags.Color, new Color(0, 0, 0, 0), 0, 0);
+                        // 컬러 플래그만 사용하여 백버퍼를 클리어합니다. (깊이와 스텐실 비활성화)
+            m_CommandBuffer.ClearRenderTarget(
+                RTClearFlags.Color,        // 컬러 버퍼만 클리어
+                new Color(0f, 0f, 0f, 0f), // 클리어 컬러: 투명 블랙
+                0f,                        // depth (깊이 버퍼 사용 안 함)
+                0                          // stencil (스텐실 버퍼 사용 안 함)
+            );
 
-            // We only need this to determine whether we're rendering into backbuffer or not. However, detection this
-            // way only works in BiRP so only do it here.
+            // 백버퍼 텍스처를 전역 변수로 지정 (머티리얼에서 확인용)
             m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.CameraTargetTexture, BuiltinRenderTextureType.CameraTarget);
 
-            // add sorting, view calc and drawing commands for each splat object
-            Material matComposite = SortAndRenderSplats(cam, m_CommandBuffer);
+            // 4) 정렬 & 렌더링 명령 추가
+            Material compositeMat = SortAndRenderSplats(cam, m_CommandBuffer);
 
-            // compose
-            m_CommandBuffer.BeginSample(s_ProfCompose);
-            m_CommandBuffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
-            m_CommandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3, 1);
-            m_CommandBuffer.EndSample(s_ProfCompose);
+            if (compositeMat != null) // compositeMat이 null이 아닐 때만 실행
+            {
+                // 5) 합성 단계: 화면 Quad로 전체 렌더결과 블렌드
+                m_CommandBuffer.BeginSample(s_ProfCompose);
+                m_CommandBuffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                // 전체 화면을 덮는 삼각형(3정점)으로 Composite
+                m_CommandBuffer.DrawProcedural(
+                    Matrix4x4.identity,
+                    compositeMat,
+                    shaderPass: 0,
+                    topology: MeshTopology.Triangles,
+                    vertexCount: 3,
+                    instanceCount: 1);
+                m_CommandBuffer.EndSample(s_ProfCompose);
+            }
+
+            // 6) 임시 RT 메모리 해제
             m_CommandBuffer.ReleaseTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT);
         }
     }
@@ -226,20 +350,26 @@ namespace GaussianSplatting.Runtime
 
         [Tooltip("Rendering order compared to other splats. Within same order splats are sorted by distance. Higher order splats render 'on top of' lower order splats.")]
         public int m_RenderOrder;
-        [Range(0.1f, 2.0f)] [Tooltip("Additional scaling factor for the splats")]
+        [Range(0.1f, 2.0f)]
+        [Tooltip("Additional scaling factor for the splats")]
         public float m_SplatScale = 1.0f;
         [Range(0.05f, 20.0f)]
         [Tooltip("Additional scaling factor for opacity")]
         public float m_OpacityScale = 1.0f;
-        [Range(0, 3)] [Tooltip("Spherical Harmonics order to use")]
+        [Range(0, 3)]
+        [Tooltip("Spherical Harmonics order to use")]
         public int m_SHOrder = 3;
         [Tooltip("Show only Spherical Harmonics contribution, using gray color")]
         public bool m_SHOnly;
-        [Range(1,30)] [Tooltip("Sort splats only every N frames")]
+        [Range(1, 30)]
+        [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;
+        [Range(0f, 1f)]
+        [Tooltip("Grayscale 모드에서 적용할 투명도")]
+        public float m_GrayAlpha = 1f;
 
         public RenderMode m_RenderMode = RenderMode.Splats;
-        [Range(1.0f,15.0f)] public float m_PointDisplaySize = 3.0f;
+        [Range(1.0f, 15.0f)] public float m_PointDisplaySize = 3.0f;
 
         public GaussianCutout[] m_Cutouts;
 
@@ -249,24 +379,32 @@ namespace GaussianSplatting.Runtime
         public Shader m_ShaderDebugBoxes;
         [Tooltip("Gaussian splatting compute shader")]
         public ComputeShader m_CSSplatUtilities;
+        
+        List<IGaussianSplatModifier> m_Modifiers = new List<IGaussianSplatModifier>();
+        // GC 최적화를 위해 활성화된 모디파이어만 담을 임시 리스트
+        private List<IGaussianSplatModifier> m_ActiveModifiersScratchList = new List<IGaussianSplatModifier>();
+
+        [NonSerialized]
+        private bool m_ForceModifierRefresh = true; // 에디터에서 모디파이어 리스트 갱신 필요 여부
 
         int m_SplatCount; // initially same as asset splat count, but editing can change this
         GraphicsBuffer m_GpuSortDistances;
         internal GraphicsBuffer m_GpuSortKeys;
-        GraphicsBuffer m_GpuPosData;
-        GraphicsBuffer m_GpuOtherData;
-        GraphicsBuffer m_GpuSHData;
-        Texture m_GpuColorData;
+        internal GraphicsBuffer m_GpuPosData;
+        internal GraphicsBuffer m_GpuOtherData;
+        internal GraphicsBuffer m_GpuSHData;
+        internal RenderTexture m_GpuColorData; // Texture에서 RenderTexture로 변경
+        RenderTexture m_GpuOriginalColorData; // 원본 컬러 데이터를 보관하는 텍스처
         internal GraphicsBuffer m_GpuChunks;
-        internal bool m_GpuChunksValid;
+        public bool m_GpuChunksValid;
         internal GraphicsBuffer m_GpuView;
         internal GraphicsBuffer m_GpuIndexBuffer;
 
         // these buffers are only for splat editing, and are lazily created
         GraphicsBuffer m_GpuEditCutouts;
         GraphicsBuffer m_GpuEditCountsBounds;
-        GraphicsBuffer m_GpuEditSelected;
-        GraphicsBuffer m_GpuEditDeleted;
+        internal GraphicsBuffer m_GpuEditSelected;
+        internal GraphicsBuffer m_GpuEditDeleted;
         GraphicsBuffer m_GpuEditSelectedMouseDown; // selection state at start of operation
         GraphicsBuffer m_GpuEditPosMouseDown; // position state at start of operation
         GraphicsBuffer m_GpuEditOtherMouseDown; // rotation/scale state at start of operation
@@ -283,10 +421,20 @@ namespace GaussianSplatting.Runtime
         GaussianSplatAsset m_PrevAsset;
         Hash128 m_PrevHash;
         bool m_Registered;
+        
+        // GPU 버퍼 접근을 위한 public getter 추가
+        public GraphicsBuffer GpuPosData => m_GpuPosData;
+        public GraphicsBuffer GpuOtherData => m_GpuOtherData;
+        public GraphicsBuffer GpuSHData => m_GpuSHData;
+        public RenderTexture GpuColorTexture => m_GpuColorData; // 이름 변경 및 타입 명시
+        public GraphicsBuffer GpuViewBuffer => m_GpuView;
+        public GraphicsBuffer GpuChunksBuffer => m_GpuChunks;
+        public ComputeShader CSSplatUtilities => m_CSSplatUtilities;
+        public int ActiveSplatCount => m_SplatCount;
 
         static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
 
-        internal static class Props
+        public static class Props
         {
             public static readonly int SplatPos = Shader.PropertyToID("_SplatPos");
             public static readonly int SplatOther = Shader.PropertyToID("_SplatOther");
@@ -339,7 +487,7 @@ namespace GaussianSplatting.Runtime
         public GaussianSplatAsset asset => m_Asset;
         public int splatCount => m_SplatCount;
 
-        enum KernelIndices
+        public enum KernelIndices
         {
             SetIndices,
             CalcDistances,
@@ -356,6 +504,9 @@ namespace GaussianSplatting.Runtime
             ScaleSelection,
             ExportData,
             CopySplats,
+            AngleBasedColorChange,
+            CalcSharedLightData,
+            CalcLightViewData,
         }
 
         public bool HasValidAsset =>
@@ -368,39 +519,85 @@ namespace GaussianSplatting.Runtime
             m_Asset.colorData != null;
         public bool HasValidRenderSetup => m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null;
 
-        const int kGpuViewDataSize = 40;
-
+        const int kGpuViewDataSize = 52;
+        
         void CreateResourcesForAsset()
         {
             if (!HasValidAsset)
                 return;
 
             m_SplatCount = asset.splatCount;
-            m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int) (asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
+            m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int)(asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
             m_GpuPosData.SetData(asset.posData.GetData<uint>());
-            m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int) (asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
+            m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int)(asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
             m_GpuOtherData.SetData(asset.otherData.GetData<uint>());
-            m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, (int) (asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
+            m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, (int)(asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
             m_GpuSHData.SetData(asset.shData.GetData<uint>());
+
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
-            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
-            tex.SetPixelData(asset.colorData.GetData<byte>(), 0);
-            tex.Apply(false, true);
-            m_GpuColorData = tex;
+            
+            if (m_GpuColorData != null && (m_GpuColorData.width != texWidth || m_GpuColorData.height != texHeight || m_GpuColorData.graphicsFormat != texFormat))
+            {
+                DestroyImmediate(m_GpuColorData);
+                m_GpuColorData = null;
+            }
+            if (m_GpuColorData == null)
+            {
+                var colorDesc = new RenderTextureDescriptor(texWidth, texHeight, texFormat, 0)
+                {
+                    enableRandomWrite = true, // 쓰기 가능하도록 설정
+                    autoGenerateMips = false,
+                    useMipMap = false,
+                    sRGB = (texFormat == GraphicsFormat.R8G8B8A8_SRGB || texFormat == GraphicsFormat.R8G8B8A8_UNorm || texFormat == GraphicsFormat.RGBA_BC7_SRGB || texFormat == GraphicsFormat.RGBA_BC7_UNorm) // SRGB 포맷인 경우 명시
+                };
+                m_GpuColorData = new RenderTexture(colorDesc) { name = "GaussianColorData_RT" };
+                m_GpuColorData.Create();
+            }
+            
+            // m_GpuOriginalColorData 생성 및 원본 데이터 로드
+            if (m_GpuOriginalColorData != null && (m_GpuOriginalColorData.width != texWidth || m_GpuOriginalColorData.height != texHeight || m_GpuOriginalColorData.graphicsFormat != texFormat))
+            {
+                DestroyImmediate(m_GpuOriginalColorData);
+                m_GpuOriginalColorData = null;
+            }
+            if (m_GpuOriginalColorData == null)
+            {
+                // OriginalColorData는 Compute Shader에서 직접 쓰이지 않으므로 enableRandomWrite = false 가능
+                var originalColorDesc = new RenderTextureDescriptor(texWidth, texHeight, texFormat, 0)
+                {
+                    enableRandomWrite = false, // 읽기 전용으로 사용될 수 있음
+                    autoGenerateMips = false,
+                    useMipMap = false,
+                    sRGB = (texFormat == GraphicsFormat.R8G8B8A8_SRGB || texFormat == GraphicsFormat.R8G8B8A8_UNorm || texFormat == GraphicsFormat.RGBA_BC7_SRGB || texFormat == GraphicsFormat.RGBA_BC7_UNorm)
+                };
+                m_GpuOriginalColorData = new RenderTexture(originalColorDesc) { name = "GaussianColorData_RT_Original" };
+                m_GpuOriginalColorData.Create();
+            }
+
+            // 임시 Texture2D를 사용하여 데이터 로드 및 RenderTexture로 복사
+            var tempTex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData_TempLoad" };
+            tempTex.SetPixelData(asset.colorData.GetData<byte>(), 0);
+            tempTex.Apply(false, false); 
+            Graphics.CopyTexture(tempTex, m_GpuOriginalColorData); // 원본 텍스처에 복사
+            // Graphics.CopyTexture(tempTex, m_GpuColorData); // 아래 CalcViewData에서 어차피 복사함
+            DestroyImmediate(tempTex);
+
             if (asset.chunkData != null && asset.chunkData.dataSize != 0)
             {
                 m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
-                    (int) (asset.chunkData.dataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
+                    (int)(asset.chunkData.dataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>())
+                { name = "GaussianChunkData" };
                 m_GpuChunks.SetData(asset.chunkData.GetData<GaussianSplatAsset.ChunkInfo>());
                 m_GpuChunksValid = true;
             }
             else
             {
-                // just a dummy chunk buffer
+                // dummy chunk buffer
                 m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1,
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>())
+                { name = "GaussianChunkData" };
                 m_GpuChunksValid = false;
             }
 
@@ -435,7 +632,7 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.SetBuffer((int)KernelIndices.SetIndices, Props.SplatSortKeys, m_GpuSortKeys);
             m_CSSplatUtilities.SetInt(Props.SplatCount, m_GpuSortDistances.count);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.SetIndices, out uint gsX, out _, out _);
-            m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (m_GpuSortDistances.count + (int)gsX - 1) / (int)gsX, 1, 1);
 
             m_SorterArgs.inputKeys = m_GpuSortDistances;
             m_SorterArgs.inputValues = m_GpuSortKeys;
@@ -451,10 +648,11 @@ namespace GaussianSplatting.Runtime
         {
             if (m_MatSplats == null && resourcesAreSetUp)
             {
-                m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
-                m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
-                m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
-                m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
+                
+                m_MatSplats = new Material(m_ShaderSplats) { name = "GaussianSplats" };
+                m_MatComposite = new Material(m_ShaderComposite) { name = "GaussianClearDstAlpha" };
+                m_MatDebugPoints = new Material(m_ShaderDebugPoints) { name = "GaussianDebugPoints" };
+                m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) { name = "GaussianDebugBoxes" };
             }
         }
 
@@ -481,13 +679,16 @@ namespace GaussianSplatting.Runtime
             EnsureMaterials();
             EnsureSorterAndRegister();
 
-            CreateResourcesForAsset();
+            // CreateResourcesForAsset(); // Update에서 처리하도록 변경 (해시 비교 후)
+            
+            RefreshModifiersList(true); // true는 기존 모디파이어도 강제 재초기화
+            m_ForceModifierRefresh = false;
         }
 
-        void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
+        public void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
         {
             ComputeShader cs = m_CSSplatUtilities;
-            int kernelIndex = (int) kernel;
+            int kernelIndex = (int)kernel;
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatPos, m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatChunks, m_GpuChunks);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatOther, m_GpuOtherData);
@@ -532,7 +733,16 @@ namespace GaussianSplatting.Runtime
 
         void DisposeResourcesForAsset()
         {
-            DestroyImmediate(m_GpuColorData);
+            if (m_GpuColorData) // RenderTexture는 DestroyImmediate 사용
+            {
+                DestroyImmediate(m_GpuColorData);
+                m_GpuColorData = null;
+            }
+            if (m_GpuOriginalColorData) // 원본 컬러 데이터도 해제
+            {
+                DestroyImmediate(m_GpuOriginalColorData);
+                m_GpuOriginalColorData = null;
+            }
 
             DisposeBuffer(ref m_GpuPosData);
             DisposeBuffer(ref m_GpuOtherData);
@@ -551,8 +761,9 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuEditDeleted);
             DisposeBuffer(ref m_GpuEditCountsBounds);
             DisposeBuffer(ref m_GpuEditCutouts);
-
-            m_SorterArgs.resources.Dispose();
+            
+            if(m_SorterArgs.resources.altBuffer != null) // GpuSorting 리소스 해제 전 null 체크
+                m_SorterArgs.resources.Dispose();
 
             m_SplatCount = 0;
             m_GpuChunksValid = false;
@@ -566,8 +777,25 @@ namespace GaussianSplatting.Runtime
 
         public void OnDisable()
         {
+            // 모디파이어 해제
+            if (m_Modifiers != null)
+            {
+                // 리스트를 복사하여 순회 (OnShutdown에서 m_Modifiers가 변경될 가능성 대비)
+                var toShutdown = new List<IGaussianSplatModifier>(m_Modifiers);
+                foreach (var modifier in m_Modifiers.Where(modifier => modifier != null))
+                {
+                    modifier.ReleaseResources();
+                    modifier.OnShutdown(this);
+                }
+                m_Modifiers.Clear();
+            }
+            m_ActiveModifiersScratchList.Clear();
+            
             DisposeResourcesForAsset();
-            GaussianSplatRenderSystem.instance.UnregisterSplat(this);
+            if (GaussianSplatRenderSystem.instance != null) // 인스턴스 null 체크 추가
+            {
+                GaussianSplatRenderSystem.instance.UnregisterSplat(this);
+            }
             m_Registered = false;
 
             DestroyImmediate(m_MatSplats);
@@ -581,6 +809,69 @@ namespace GaussianSplatting.Runtime
             if (cam.cameraType == CameraType.Preview)
                 return;
 
+#if UNITY_EDITOR
+            if (!Application.isPlaying && m_ForceModifierRefresh) {
+                RefreshModifiersList(true);
+                m_ForceModifierRefresh = false;
+            }
+#endif
+
+            // --- 매 프레임 m_GpuColorData를 원본으로 복원 ---
+            if (m_GpuOriginalColorData != null && m_GpuColorData != null)
+            {
+                cmb.CopyTexture(m_GpuOriginalColorData, m_GpuColorData);
+            }
+            // --- 원본 복원 끝 ---
+            
+            // 기본 데이터 및 포맷 정보를 Compute Shader에 바인딩 (모든 모디파이어가 접근 가능하도록 먼저 설정)
+            SetAssetDataOnCS(cmb, KernelIndices.CalcViewData);  // 이 함수는 _SplatColor (읽기용)를 바인딩할 수 있음.
+                                                                // AngleBasedColorModifier는 _SplatColorRW를 사용하므로 충돌 없음.
+
+            // --- 유니폼 기본값 설정 ---
+            if (m_CSSplatUtilities != null)
+            {
+                // Shader.PropertyToID 결과는 캐싱하는 것이 좋습니다 (예: Props 클래스 내부).
+                int tintColorID = Shader.PropertyToID("_GlobalTintColor");
+                int exposureID = Shader.PropertyToID("_Exposure");
+                cmb.SetComputeVectorParam(m_CSSplatUtilities, tintColorID, Color.white);
+                cmb.SetComputeFloatParam(m_CSSplatUtilities, exposureID, 1.0f);
+            }
+            // --- 유니폼 기본값 설정 끝 ---
+
+            m_ActiveModifiersScratchList.Clear(); // 임시 리스트 초기화
+            if (m_Modifiers != null)
+            {
+                foreach (var modAsInterface in m_Modifiers)
+                {
+                    if (modAsInterface == null) continue;
+
+                    MonoBehaviour monoMod = modAsInterface as MonoBehaviour;
+                    if (monoMod == null || !monoMod.enabled) continue; // Unity 컴포넌트 비활성화 체크
+
+                    bool modifierLogicActive = true; // 기본적으로 활성화로 간주
+                    if (modAsInterface is BaseGaussianSplatModifier baseMod)
+                    {
+                        modifierLogicActive = baseMod.IsModifierActive; // 커스텀 활성화 변수 체크
+                    }
+                    // BaseGaussianSplatModifier를 상속하지 않은 IGaussianSplatModifier는 IsModifierActive가 없으므로,
+                    // MonoBehaviour.enabled 만으로 판단하거나, 항상 활성으로 간주할 수 있습니다.
+                    // 위 로직은 BaseGaussianSplatModifier가 아니면 modifierLogicActive가 true로 유지됩니다.
+
+                    if (modifierLogicActive)
+                    {
+                        m_ActiveModifiersScratchList.Add(modAsInterface);
+                    }
+                }
+            }
+
+            if (m_ActiveModifiersScratchList.Count > 0 && HasValidAsset && HasValidRenderSetup)
+            {
+                foreach (var modifier in m_ActiveModifiersScratchList)
+                {
+                    modifier.ExecuteGPUModifications(cmb, this, cam);
+                }
+            }
+
             var tr = transform;
 
             Matrix4x4 matView = cam.worldToCameraMatrix;
@@ -592,8 +883,6 @@ namespace GaussianSplatting.Runtime
             Vector4 camPos = cam.transform.position;
 
             // calculate view dependent data for each splat
-            SetAssetDataOnCS(cmb, KernelIndices.CalcViewData);
-
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, matView * matO2W);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
@@ -606,7 +895,7 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
-            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1) / (int)gsX, 1, 1);
         }
 
         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)
@@ -630,16 +919,65 @@ namespace GaussianSplatting.Runtime
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcDistances, out uint gsX, out _, out _);
-            cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1) / (int)gsX, 1, 1);
 
             // sort the splats
             EnsureSorterAndRegister();
             m_Sorter.Dispatch(cmd, m_SorterArgs);
             cmd.EndSample(s_ProfSort);
         }
+        
+        // 모디파이어 MaterialPropertyBlock 적용 메서드 (GaussianSplatRenderSystem에서 호출됨)
+        public void ApplyModifierMaterialProperties(MaterialPropertyBlock mpb, Camera cam)
+        {
+#if UNITY_EDITOR
+            if (!Application.isPlaying && m_ForceModifierRefresh) {
+                RefreshModifiersList(true);
+                m_ForceModifierRefresh = false;
+            }
+#endif
+            m_ActiveModifiersScratchList.Clear(); // 임시 리스트 초기화
+            if (m_Modifiers != null)
+            {
+                foreach (var modAsInterface in m_Modifiers)
+                {
+                    if (modAsInterface == null) continue;
+                    MonoBehaviour monoMod = modAsInterface as MonoBehaviour;
+                    if (monoMod == null || !monoMod.enabled) continue;
+
+                    bool modifierLogicActive = true;
+                    if (modAsInterface is BaseGaussianSplatModifier baseMod)
+                    {
+                        modifierLogicActive = baseMod.IsModifierActive;
+                    }
+                
+                    if (modifierLogicActive)
+                    {
+                        m_ActiveModifiersScratchList.Add(modAsInterface);
+                    }
+                }
+            }
+        
+            if (m_ActiveModifiersScratchList.Count > 0 && HasValidAsset && HasValidRenderSetup)
+            {
+                foreach (var modifier in m_ActiveModifiersScratchList)
+                {
+                    modifier.SetMaterialProperties(mpb, this, cam);
+                }
+            }
+        }
 
         public void Update()
         {
+#if UNITY_EDITOR
+            // 에디터에서 플레이 중이 아닐 때, Hierarchy 변경 등으로 모디파이어 리스트가 바뀔 수 있음
+            if (!Application.isPlaying && m_ForceModifierRefresh)
+            {
+                RefreshModifiersList(true); // 변경 감지 시 강제 초기화 포함 갱신
+                m_ForceModifierRefresh = false;
+            }
+#endif
+            
             var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
             if (m_PrevAsset != m_Asset || m_PrevHash != curHash)
             {
@@ -649,6 +987,8 @@ namespace GaussianSplatting.Runtime
                 {
                     DisposeResourcesForAsset();
                     CreateResourcesForAsset();
+                    
+                    RefreshModifiersList(true); // Asset 변경 시 모든 모디파이어 강제 재초기화
                 }
                 else
                 {
@@ -656,6 +996,85 @@ namespace GaussianSplatting.Runtime
                 }
             }
         }
+
+#if UNITY_EDITOR
+    void OnValidate()
+    {
+        if (gameObject.activeInHierarchy && enabled)
+        {
+            // OnValidate는 매우 자주 호출될 수 있으므로, 실제 변경을 감지하는 더 정교한 로직이 필요할 수 있음
+            // 여기서는 단순하게 플래그만 설정
+            UnityEditor.EditorApplication.delayCall += () => {
+                if (this != null && gameObject != null) //객체 파괴 확인
+                {
+                    m_ForceModifierRefresh = true;
+                }
+            };
+        }
+    }
+
+    void OnTransformChildrenChanged()
+    {
+        if (gameObject.activeInHierarchy && enabled)
+        {
+             UnityEditor.EditorApplication.delayCall += () => {
+                if (this != null && gameObject != null)
+                {
+                    m_ForceModifierRefresh = true;
+                }
+            };
+        }
+    }
+#endif
+
+    private void RefreshModifiersList(bool forceReinitializeExisting)
+    {
+        bool canInitializeModifiers = HasValidAsset && HasValidRenderSetup;
+
+        List<IGaussianSplatModifier> foundModifiers = new List<IGaussianSplatModifier>();
+        // 자식 객체 및 비활성화된 컴포넌트도 일단 모두 가져옵니다.
+        // 실제 사용 여부는 Execute/SetProperties 시점에 MonoBehaviour.enabled와 IsModifierActive로 결정합니다.
+        GetComponentsInChildren<IGaussianSplatModifier>(true, foundModifiers);
+
+        // 1. 제거된 모디파이어 처리 (m_Modifiers에 있지만 foundModifiers에는 없는 경우)
+        for (int i = m_Modifiers.Count - 1; i >= 0; i--)
+        {
+            var existingModifier = m_Modifiers[i];
+            // (existingModifier as MonoBehaviour) == null 체크는 Unity에서 Destroy된 객체를 확인하는 일반적인 방법입니다.
+            if (existingModifier == null || (existingModifier as MonoBehaviour) == null || !foundModifiers.Contains(existingModifier))
+            {
+                if (existingModifier != null) // 아직 Shutdown되지 않았다면
+                {
+                    existingModifier.ReleaseResources();
+                    existingModifier.OnShutdown(this);
+                }
+                m_Modifiers.RemoveAt(i);
+            }
+        }
+
+        // 2. 새로 추가된 모디파이어 및 기존 모디파이어 상태 갱신
+        foreach (var foundModifier in foundModifiers)
+        {
+            if (foundModifier == null || (foundModifier as MonoBehaviour) == null) continue;
+
+            bool isNew = !m_Modifiers.Contains(foundModifier);
+            if (isNew)
+            {
+                m_Modifiers.Add(foundModifier);
+            }
+
+            // 새로 추가되었거나, 강제 재초기화가 필요하거나, Asset이 준비되었는데 아직 초기화 안된 경우
+            // 그리고 해당 모디파이어의 GameObject와 Component가 모두 활성화된 경우
+            MonoBehaviour monoMod = foundModifier as MonoBehaviour;
+            bool shouldInitialize = monoMod != null && monoMod.isActiveAndEnabled; // GameObject 활성화 + Component 활성화
+
+            if (canInitializeModifiers && shouldInitialize && (isNew || forceReinitializeExisting))
+            {
+                foundModifier.OnInitialize(m_Asset, this);
+                foundModifier.SetupResources(this);
+            }
+        }
+    }
 
         public void ActivateCamera(int index)
         {
@@ -684,7 +1103,7 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.SetBuffer((int)KernelIndices.ClearBuffer, Props.DstBuffer, buf);
             m_CSSplatUtilities.SetInt(Props.BufferSize, buf.count);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.ClearBuffer, out uint gsX, out _, out _);
-            m_CSSplatUtilities.Dispatch((int)KernelIndices.ClearBuffer, (int)((buf.count+gsX-1)/gsX), 1, 1);
+            m_CSSplatUtilities.Dispatch((int)KernelIndices.ClearBuffer, (int)((buf.count + gsX - 1) / gsX), 1, 1);
         }
 
         void UnionGraphicsBuffers(GraphicsBuffer dst, GraphicsBuffer src)
@@ -693,7 +1112,7 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.SetBuffer((int)KernelIndices.OrBuffers, Props.DstBuffer, dst);
             m_CSSplatUtilities.SetInt(Props.BufferSize, dst.count);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.OrBuffers, out uint gsX, out _, out _);
-            m_CSSplatUtilities.Dispatch((int)KernelIndices.OrBuffers, (int)((dst.count+gsX-1)/gsX), 1, 1);
+            m_CSSplatUtilities.Dispatch((int)KernelIndices.OrBuffers, (int)((dst.count + gsX - 1) / gsX), 1, 1);
         }
 
         static float SortableUintToFloat(uint v)
@@ -722,7 +1141,7 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.UpdateEditData, Props.DstBuffer, m_GpuEditCountsBounds);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BufferSize, m_GpuEditSelected.count);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.UpdateEditData, out uint gsX, out _, out _);
-            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.UpdateEditData, (int)((m_GpuEditSelected.count+gsX-1)/gsX), 1, 1);
+            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.UpdateEditData, (int)((m_GpuEditSelected.count + gsX - 1) / gsX), 1, 1);
             Graphics.ExecuteCommandBuffer(cmb);
 
             uint[] res = new uint[m_GpuEditCountsBounds.count];
@@ -735,7 +1154,7 @@ namespace GaussianSplatting.Runtime
             Bounds bounds = default;
             bounds.SetMinMax(min, max);
             if (bounds.extents.sqrMagnitude < 0.01)
-                bounds.extents = new Vector3(0.1f,0.1f,0.1f);
+                bounds.extents = new Vector3(0.1f, 0.1f, 0.1f);
             editSelectedBounds = bounds;
         }
 
@@ -774,10 +1193,10 @@ namespace GaussianSplatting.Runtime
                 var target = GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource |
                              GraphicsBuffer.Target.CopyDestination;
                 var size = (m_SplatCount + 31) / 32;
-                m_GpuEditSelected = new GraphicsBuffer(target, size, 4) {name = "GaussianSplatSelected"};
-                m_GpuEditSelectedMouseDown = new GraphicsBuffer(target, size, 4) {name = "GaussianSplatSelectedInit"};
-                m_GpuEditDeleted = new GraphicsBuffer(target, size, 4) {name = "GaussianSplatDeleted"};
-                m_GpuEditCountsBounds = new GraphicsBuffer(target, 3 + 6, 4) {name = "GaussianSplatEditData"}; // selected count, deleted bound, cut count, float3 min, float3 max
+                m_GpuEditSelected = new GraphicsBuffer(target, size, 4) { name = "GaussianSplatSelected" };
+                m_GpuEditSelectedMouseDown = new GraphicsBuffer(target, size, 4) { name = "GaussianSplatSelectedInit" };
+                m_GpuEditDeleted = new GraphicsBuffer(target, size, 4) { name = "GaussianSplatDeleted" };
+                m_GpuEditCountsBounds = new GraphicsBuffer(target, 3 + 6, 4) { name = "GaussianSplatEditData" };
                 ClearGraphicsBuffer(m_GpuEditSelected);
                 ClearGraphicsBuffer(m_GpuEditSelectedMouseDown);
                 ClearGraphicsBuffer(m_GpuEditDeleted);
@@ -795,7 +1214,7 @@ namespace GaussianSplatting.Runtime
         {
             if (m_GpuEditPosMouseDown == null)
             {
-                m_GpuEditPosMouseDown = new GraphicsBuffer(m_GpuPosData.target | GraphicsBuffer.Target.CopyDestination, m_GpuPosData.count, m_GpuPosData.stride) {name = "GaussianSplatEditPosMouseDown"};
+                m_GpuEditPosMouseDown = new GraphicsBuffer(m_GpuPosData.target | GraphicsBuffer.Target.CopyDestination, m_GpuPosData.count, m_GpuPosData.stride) { name = "GaussianSplatEditPosMouseDown" };
             }
             Graphics.CopyBuffer(m_GpuPosData, m_GpuEditPosMouseDown);
         }
@@ -803,7 +1222,7 @@ namespace GaussianSplatting.Runtime
         {
             if (m_GpuEditOtherMouseDown == null)
             {
-                m_GpuEditOtherMouseDown = new GraphicsBuffer(m_GpuOtherData.target | GraphicsBuffer.Target.CopyDestination, m_GpuOtherData.count, m_GpuOtherData.stride) {name = "GaussianSplatEditOtherMouseDown"};
+                m_GpuEditOtherMouseDown = new GraphicsBuffer(m_GpuOtherData.target | GraphicsBuffer.Target.CopyDestination, m_GpuOtherData.count, m_GpuOtherData.stride) { name = "GaussianSplatEditOtherMouseDown" };
             }
             Graphics.CopyBuffer(m_GpuOtherData, m_GpuEditOtherMouseDown);
         }
@@ -822,7 +1241,8 @@ namespace GaussianSplatting.Runtime
             Vector4 screenPar = new Vector4(screenW, screenH, 0, 0);
             Vector4 camPos = cam.transform.position;
 
-            using var cmb = new CommandBuffer { name = "SplatSelectionUpdate" };
+            using var cmb = new CommandBuffer();
+            cmb.name = "SplatSelectionUpdate";
             SetAssetDataOnCS(cmb, KernelIndices.SelectionUpdate);
 
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, matView * matO2W);
@@ -856,7 +1276,7 @@ namespace GaussianSplatting.Runtime
         public void EditRotateSelection(Vector3 localSpaceCenter, Matrix4x4 localToWorld, Matrix4x4 worldToLocal, Quaternion rotation)
         {
             if (!EnsureEditingBuffers()) return;
-            if (m_GpuEditPosMouseDown == null || m_GpuEditOtherMouseDown == null) return; // should have captured initial state
+            if (m_GpuEditPosMouseDown == null || m_GpuEditOtherMouseDown == null) return;
 
             using var cmb = new CommandBuffer { name = "SplatRotateSelection" };
             SetAssetDataOnCS(cmb, KernelIndices.RotateSelection);
@@ -873,11 +1293,10 @@ namespace GaussianSplatting.Runtime
             editModified = true;
         }
 
-
         public void EditScaleSelection(Vector3 localSpaceCenter, Matrix4x4 localToWorld, Matrix4x4 worldToLocal, Vector3 scale)
         {
             if (!EnsureEditingBuffers()) return;
-            if (m_GpuEditPosMouseDown == null) return; // should have captured initial state
+            if (m_GpuEditPosMouseDown == null) return;
 
             using var cmb = new CommandBuffer { name = "SplatScaleSelection" };
             SetAssetDataOnCS(cmb, KernelIndices.ScaleSelection);
@@ -974,7 +1393,7 @@ namespace GaussianSplatting.Runtime
 
             int posStride = (int)(asset.posData.dataSize / asset.splatCount);
             int otherStride = (int)(asset.otherData.dataSize / asset.splatCount);
-            int shStride = (int) (asset.shData.dataSize / asset.splatCount);
+            int shStride = (int)(asset.shData.dataSize / asset.splatCount);
 
             // create new GPU buffers
             var newPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, newSplatCount * posStride / 4, 4) { name = "GaussianPosData" };
@@ -990,9 +1409,9 @@ namespace GaussianSplatting.Runtime
             // selected/deleted buffers
             var selTarget = GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource | GraphicsBuffer.Target.CopyDestination;
             var selSize = (newSplatCount + 31) / 32;
-            var newEditSelected = new GraphicsBuffer(selTarget, selSize, 4) {name = "GaussianSplatSelected"};
-            var newEditSelectedMouseDown = new GraphicsBuffer(selTarget, selSize, 4) {name = "GaussianSplatSelectedInit"};
-            var newEditDeleted = new GraphicsBuffer(selTarget, selSize, 4) {name = "GaussianSplatDeleted"};
+            var newEditSelected = new GraphicsBuffer(selTarget, selSize, 4) { name = "GaussianSplatSelected" };
+            var newEditSelectedMouseDown = new GraphicsBuffer(selTarget, selSize, 4) { name = "GaussianSplatSelectedInit" };
+            var newEditDeleted = new GraphicsBuffer(selTarget, selSize, 4) { name = "GaussianSplatDeleted" };
             ClearGraphicsBuffer(newEditSelected);
             ClearGraphicsBuffer(newEditSelectedMouseDown);
             ClearGraphicsBuffer(newEditDeleted);
@@ -1077,7 +1496,7 @@ namespace GaussianSplatting.Runtime
         void DispatchUtilsAndExecute(CommandBuffer cmb, KernelIndices kernel, int count)
         {
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)kernel, out uint gsX, out _, out _);
-            cmb.DispatchCompute(m_CSSplatUtilities, (int)kernel, (int)((count + gsX - 1)/gsX), 1, 1);
+            cmb.DispatchCompute(m_CSSplatUtilities, (int)kernel, (int)((count + gsX - 1) / gsX), 1, 1);
             Graphics.ExecuteCommandBuffer(cmb);
         }
 

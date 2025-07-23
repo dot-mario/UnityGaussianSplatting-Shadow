@@ -136,7 +136,7 @@ struct SplatSHData
     half3 col, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, sh9, sh10, sh11, sh12, sh13, sh14, sh15;
 };
 
-half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH)
+half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH, half4 globalTintColor, half exposure)
 {
     dir *= -1;
 
@@ -175,6 +175,11 @@ half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH)
             }
         }
     }
+    
+    // 모디파이어에 의한 색상 조절 적용
+    res.rgb *= globalTintColor.rgb;
+    res.rgb *= exposure;
+    
     return max(res, 0);
 }
 
@@ -607,11 +612,96 @@ SplatData LoadSplatData(uint idx)
     return s;
 }
 
+SplatData LoadSplatDataForShadows(uint idx)
+{
+    SplatData s = (SplatData)0; // SplatData 구조체를 0으로 초기화
+
+    // figure out raw data offsets / locations
+    uint3 coord = SplatIndexToPixelIndex(idx); // 불투명도 로드를 위해 coord는 필요
+
+    // 스케일 포맷과 SH 포맷은 _SplatOther 버퍼의 stride 계산에 영향을 주므로 읽어야 함
+    uint scaleFmt = (_SplatFormat >> 8) & 0xFF;
+    uint shFormat = (_SplatFormat >> 16) & 0xFF; // shIndex 존재 여부 확인용
+
+    // _SplatOther 버퍼에서 scale 데이터의 시작 위치를 정확히 찾기 위해
+    // 기존 otherStride 계산 로직 유지 (SH 관련 부분 포함)
+    uint otherStride = 4; // rotation is 10.10.10.2
+    if (scaleFmt == VECTOR_FMT_32F)
+        otherStride += 12;
+    else if (scaleFmt == VECTOR_FMT_16)
+        otherStride += 6;
+    else if (scaleFmt == VECTOR_FMT_11)
+        otherStride += 4;
+    else if (scaleFmt == VECTOR_FMT_6)
+        otherStride += 2;
+    
+    // shFormat > VECTOR_FMT_6 인 경우, _SplatOther 데이터의 끝에 shIndex(ushort)가 저장됨
+    // 이 shIndex는 _SplatSH 버퍼에서 실제 SH 계수를 찾기 위한 인덱스이지만,
+    // 그림자 함수에서는 SH 계수를 로드하지 않으므로 shIndex 값 자체는 사용하지 않음.
+    // 다만, shIndex가 _SplatOther에 포함되어 있다면 otherStride 계산에는 반영되어야 함.
+    if (shFormat > VECTOR_FMT_6) 
+        otherStride += 2; 
+    
+    uint otherAddr = idx * otherStride;
+
+    // --- 필수 데이터 로드 ---
+    s.pos   = LoadSplatPosValue(idx);
+    s.rot   = DecodeRotation(DecodePacked_10_10_10_2(LoadUInt(_SplatOther, otherAddr)));
+    s.scale = LoadAndDecodeVector(_SplatOther, otherAddr + 4, scaleFmt);
+    
+    // 불투명도(alpha)는 _SplatColor 텍스처에서 로드 (col.a)
+    half4 col = LoadSplatColTex(coord);
+
+    // --- SH 관련 로딩 로직 전체 제거 ---
+    // uint shIndex = idx;
+    // if (shFormat > VECTOR_FMT_6)
+    //     shIndex = LoadUShort(_SplatOther, otherAddr + otherStride - 2); // 이 값은 이제 사용 안 함
+    // uint shStride = ... ; // shStride 계산 로직 제거
+    // uint shOffset = shIndex * shStride; // shOffset 계산 로직 제거
+    // _SplatSH.Load4(...) 등 SH 계수 로딩 로직 전체 제거
+
+    // 청크 데이터 처리 (위치, 스케일, 불투명도만)
+    uint chunkIdx = idx / kChunkSize;
+    if (chunkIdx < _SplatChunkCount)
+    {
+        SplatChunkInfo chunk = _SplatChunks[chunkIdx];
+        float3 posMin = float3(chunk.posX.x, chunk.posY.x, chunk.posZ.x);
+        float3 posMax = float3(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
+        half3 sclMin = half3(f16tof32(chunk.sclX    ), f16tof32(chunk.sclY    ), f16tof32(chunk.sclZ    ));
+        half3 sclMax = half3(f16tof32(chunk.sclX>>16), f16tof32(chunk.sclY>>16), f16tof32(chunk.sclZ>>16));
+        
+        // 불투명도 보간을 위해 colMin, colMax는 필요
+        half4 colMin = half4(f16tof32(chunk.colR    ), f16tof32(chunk.colG    ), f16tof32(chunk.colB    ), f16tof32(chunk.colA    ));
+        half4 colMax = half4(f16tof32(chunk.colR>>16), f16tof32(chunk.colG>>16), f16tof32(chunk.colB>>16), f16tof32(chunk.colA>>16));
+
+        s.pos = lerp(posMin, posMax, s.pos);
+        s.scale = lerp(sclMin, sclMax, s.scale);
+        
+        // 원본의 스케일 후처리 로직 (지수 스케일링)
+        s.scale *= s.scale;
+        s.scale *= s.scale;
+        s.scale *= s.scale;
+        
+        // 불투명도 보간 및 후처리
+        col = lerp(colMin, colMax, col);
+        col.a = InvSquareCentered01(col.a); // 원본의 불투명도 후처리
+
+        // --- SH 보간 로직 제거 ---
+        // if (shFormat > VECTOR_FMT_32F && shFormat <= VECTOR_FMT_6) { ... }
+    }
+
+    s.opacity = col.a; // 최종 불투명도 할당
+    // s.sh.col = col.rgb; // s.sh.col은 그림자에 필요 없으므로 할당하지 않거나 0으로 둠
+
+    return s;
+}
+
 struct SplatViewData
 {
-    float4 pos;
+    float4 centerClipPos;
     float2 axis1, axis2;
     uint2 color; // 4xFP16
+    float3 centerWorldPos; // <<< 추가: 스플랫 중심의 월드 좌표
 };
 
 // If we are rendering into backbuffer directly (e.g. HDR off, no postprocessing),
@@ -631,5 +721,23 @@ void FlipProjectionIfBackbuffer(inout float4 vpos)
     if (_CameraTargetTexture_TexelSize.z == 1.0)
         vpos.y = -vpos.y;
 }
+
+struct LightViewData
+{
+    float4 centerClipPos;       // 스플랫 중심의 광원 클립 공간 좌표 (x,y,z,w)
+    float2 axis1;       // 광원 시점에서 투영된 2D 타원의 주축1 (scaled)
+    float2 axis2;       // 광원 시점에서 투영된 2D 타원의 부축2 (scaled)
+    half   opacity;     // 스플랫의 최종 불투명도 (원본 * 전역 스케일)
+    // 필요시 추가 데이터 (예: view space depth 등)
+};
+
+struct SharedLightData
+{
+    float3 splatLocalPos;
+    float3 centerWorldPos;
+    float3 cov3d0;
+    float3 cov3d1;
+    half opacity;
+};
 
 #endif // GAUSSIAN_SPLATTING_HLSL
