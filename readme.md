@@ -1,6 +1,20 @@
 # R-2. Gaussian Splat Shadow Rendering TDD
 
-이 브랜치는 예전의 시도에 대한 코드입니다. 실패한 코드입니다.
+이 브랜치는 예전의 시도에 대한 코드입니다.
+
+## 현재 문제 상황:
+저는 Unity URP(Universal Render Pipeline) 환경에서 Gaussian Splatting 모델에 동적 포인트 라이트 그림자를 구현하고 있습니다. 그림자 생성 방식은 포인트 라이트 위치에서 6방향으로 뎁스 맵(Depth Map)을 렌더링하여 6개의 개별 2D 텍스처에 저장한 후, 주 렌더링 패스에서 이 텍스처들을 샘플링하여 그림자를 적용하는 것입니다.
+하지만 현재 6개의 뎁스 텍스처에 올바른 6방향 뷰가 렌더링되지 않고, 잘못된 결과가 그려지는 문제가 발생하고 있습니다. 주 렌더링 패스(RenderGaussianSplats.shader)는 정상적으로 동작하지만, 그림자 맵을 생성하는 섀도우 캐스터 패스(ShadowCasterSplat.shader)에 문제가 있는 것으로 보입니다. 특히, 각 큐브맵 면에 대한 뷰 변환을 계산하고 적용하는 컴퓨트 셰이더 단계에서 좌표계 문제가 있는 것으로 강력히 의심됩니다.
+
+### 핵심 파이프라인:
+1. CSCalcSharedLightData (Compute Shader): 6번의 렌더링 루프 밖에서 한 번만 실행됩니다. 스플랫의 로컬 좌표, 월드 좌표, 3D 공분산 등 재사용 가능한 데이터를 계산하여 SharedLightData 버퍼에 저장합니다.
+2. CSCalcLightViewData (Compute Shader): 큐브맵의 6개 면에 대해 각각 루프를 돌며 실행됩니다.
+    * C#에서 현재 면에 맞는 _LightModelViewMatrix와 _LightProjMatrix를 전달받습니다.
+    * SharedLightData 버퍼를 입력으로 받아, 스플랫의 최종 클립 공간 위치와 화면상 모양(2D 타원 축)을 계산하여 LightViewData 버퍼에 저장합니다.
+3. ShadowCasterSplat.shader (Vertex/Fragment Shader):
+    * LightViewData 버퍼를 읽어 각 스플랫을 뎁스 텍스처에 렌더링(DrawProcedural)하여 깊이 값을 기록합니다.
+
+CSCalcLightViewData 커널이 6개의 다른 _LightModelViewMatrix를 받음에도 불구하고, 결과적으로 6개의 뎁스 텍스처가 모두 비슷하게 잘못 렌더링됩니다. 이는 CSCalcLightViewData 내부의 좌표 변환 로직이 _LightModelViewMatrix를 올바르게 활용하지 못하고 있거나, 잘못된 값을 커널에 전달 하는 것으로 시사됩니다.
 
 ```mermaid
 ---
