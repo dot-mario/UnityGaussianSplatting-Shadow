@@ -875,17 +875,24 @@ void CSCalcSharedLightData(uint3 id : SV_DispatchThreadID)
 
     sharedLightData.splatLocalPos = splat.pos;
     // 2. 월드 좌표 계산 (CSCalcViewData와 동일)
-    sharedLightData.centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos, 1.0f)).xyz;
+    sharedLightData.centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos, 1)).xyz;
+    float splatScale = _SplatScale;
 
     // CSCalcViewData의 검증된 스케일 계산 방식 사용
-    float3x3 splatRotScaleMat = CalcMatrixFromRotationScale(splat.rot, splat.scale);
-    CalcCovariance3D(splatRotScaleMat, sharedLightData.cov3d0, sharedLightData.cov3d1);
+    float4 boxRot = splat.rot;
+    float3 boxSize = splat.scale;
     
-    float splatScale2 = _SplatScale * _SplatScale;
-    sharedLightData.cov3d0 *= splatScale2;
-    sharedLightData.cov3d1 *= splatScale2;
+    float3x3 splatRotScaleMat = CalcMatrixFromRotationScale(boxRot, boxSize);
+
+    float3 cov3d0, cov3d1;
+    CalcCovariance3D(splatRotScaleMat, cov3d0, cov3d1);
+    float splatScale2 = splatScale * splatScale;
+    cov3d0 *= splatScale2;
+    cov3d1 *= splatScale2;
+    sharedLightData.cov3d0 = cov3d0;
+    sharedLightData.cov3d1 = cov3d1;
     
-    sharedLightData.opacity = min(splat.opacity * _SplatOpacityScale, 65000.0h);
+    sharedLightData.opacity = min(splat.opacity * _SplatOpacityScale, 65000);
 
     _SharedLightDataOutput[idx] = sharedLightData;
 }
@@ -918,6 +925,9 @@ void CSCalcLightViewData (uint3 id : SV_DispatchThreadID)
     // 4. 클립 공간 좌표 계산 (광원 행렬 사용)
     float4x4 lightViewProjMatrix = mul(_LightProjMatrix, _LightViewMatrix);
     float4 centerLightClipPos = mul(lightViewProjMatrix, float4(sharedLightData.centerWorldPos, 1.0f));
+    
+    // float4x4 lightMVPMatrix = mul(_LightProjMatrix, _LightModelViewMatrix);
+    // float4 centerLightClipPos = mul(lightMVPMatrix, float4(sharedLightData.splatLocalPos, 1.0f));
 
     lightView.centerClipPos = centerLightClipPos;
 
