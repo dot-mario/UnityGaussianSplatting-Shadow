@@ -228,7 +228,7 @@ namespace GaussianSplatting.Runtime
             
             m_GaussianSplatRenderer.SetAssetDataOnCS(cmd, GaussianSplatRenderer.KernelIndices.CalcLightViewData);
 
-            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
+            Matrix4x4 lightProjectionMatrix = GL.GetGPUProjectionMatrix(Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane), true);
 
             // 루프 외부에서 설정 가능한 컴퓨트 셰이더 파라미터 (CSCalcLightViewDataKernel용)
             cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
@@ -523,17 +523,61 @@ namespace GaussianSplatting.Runtime
 
         private Matrix4x4 GetLightViewMatrixForFace(CubemapFace face)
         {
-            // Unity 표준 LookAt 사용 (Y-up, Z-forward 스타일)
+            // 1. OpenGL 큐브맵 표준에 맞는 LookAt 파라미터 설정
+            // Target: 뷰의 방향
+            // Up: 뷰의 상단 방향
+            Vector3 targetDirection;
+            Vector3 upDirection;
+
             switch (face)
             {
-                case CubemapFace.PositiveX: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.right, Vector3.up);
-                case CubemapFace.NegativeX: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.left, Vector3.up);
-                case CubemapFace.PositiveY: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.up, Vector3.back);    // Up direction is -Z in world space
-                case CubemapFace.NegativeY: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.down, Vector3.forward);  // Up direction is +Z in world space
-                case CubemapFace.PositiveZ: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.forward, Vector3.up);
-                case CubemapFace.NegativeZ: return Matrix4x4.LookAt(pointLightTransform.position, pointLightTransform.position + Vector3.back, Vector3.up);
-                default:                    return Matrix4x4.identity;
+                // Target: +X (Right), Up: -Y
+                case CubemapFace.PositiveX: 
+                    targetDirection = Vector3.right;
+                    upDirection = Vector3.down;
+                    break;
+                // Target: -X (Left), Up: -Y
+                case CubemapFace.NegativeX:
+                    targetDirection = Vector3.left;
+                    upDirection = Vector3.down;
+                    break;
+                // Target: +Y (Up), Up: +Z
+                case CubemapFace.PositiveY:
+                    targetDirection = Vector3.up;
+                    upDirection = Vector3.forward;
+                    break;
+                // Target: -Y (Down), Up: -Z
+                case CubemapFace.NegativeY:
+                    targetDirection = Vector3.down;
+                    upDirection = Vector3.back;
+                    break;
+                // Target: +Z (Forward), Up: -Y
+                case CubemapFace.PositiveZ:
+                    targetDirection = Vector3.forward;
+                    upDirection = Vector3.down;
+                    break;
+                // Target: -Z (Back), Up: -Y
+                case CubemapFace.NegativeZ:
+                    targetDirection = Vector3.back;
+                    upDirection = Vector3.down;
+                    break;
+                default:
+                    return Matrix4x4.identity;
             }
+
+            // 2. Unity의 LookAt 함수를 사용하여 View 행렬 생성 (+Z가 전방인 뷰 공간)
+            Matrix4x4 unityViewMatrix = Matrix4x4.LookAt(
+                pointLightTransform.position, 
+                pointLightTransform.position + targetDirection, 
+                upDirection
+            );
+
+            // 3. Unity의 +Z 전방 뷰 공간을 OpenGL의 -Z 전방 뷰 공간으로 변환
+            // 뷰 공간의 Z 좌표를 뒤집는 변환 행렬을 곱해준다.
+            // 이는 카메라의 Z축을 반전시키는 것과 동일한 효과를 낸다.
+            Matrix4x4 glFixMatrix = Matrix4x4.Scale(new Vector3(1, 1, -1));
+    
+            return glFixMatrix * unityViewMatrix;
         }
 
         private void CleanupResources()
