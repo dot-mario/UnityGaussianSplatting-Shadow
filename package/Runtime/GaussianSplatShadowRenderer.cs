@@ -146,7 +146,7 @@ namespace GaussianSplatting.Runtime
                 RenderShadowFacesNonURP(); 
             }
             // 비URP 시에도 주 렌더러의 머티리얼에 텍스처와 파라미터 설정
-            SetShadowParametersOnMainMaterial(m_ShadowFaceRTs);
+            SetShadowParametersOnMainMaterial();
         }
         
         public bool IsRenderNeeded()
@@ -357,37 +357,10 @@ namespace GaussianSplatting.Runtime
             return GraphicsSettings.currentRenderPipeline is UniversalRenderPipelineAsset;
         }
 
-        public void SetShadowParametersOnMainMaterial(Texture[] shadowFaceTextures)
+        public void SetShadowParametersOnMainMaterial()
         {
             if (!m_GaussianSplatRenderer || !m_GaussianSplatRenderer.m_MatSplats) return;
             Material mainSplatMaterial = m_GaussianSplatRenderer.m_MatSplats;
-
-            if (shadowFaceTextures != null && shadowFaceTextures.Length == 6)
-            {
-                for (int i = 0; i < 6; i++)
-                {
-                    // shadowFaceTextures[i]가 null일 수 있으므로 (URP에서 TextureHandle이 실제 Texture로 resolve 안될 때 등) 확인
-                    if (shadowFaceTextures[i] != null) 
-                    {
-                        mainSplatMaterial.SetTexture(s_ShadowMapFaceTextureIDs[i], shadowFaceTextures[i]);
-                    }
-                    // else : null이면 텍스처를 설정하지 않거나, 기본 텍스처를 설정할 수 있습니다.
-                    // 예: mainSplatMaterial.SetTexture(s_ShadowMapFaceTextureIDs[i], Texture2D.whiteTexture); // 또는 null
-                }
-            }
-            // 비URP 경로에서는 m_ShadowFaceRTs를 사용
-            else if (!IsURPActive() && m_ShadowFaceRTs != null && m_ShadowFaceRTs[0] != null) // m_ShadowFaceRTs[0] != null 추가하여 배열 초기화 확인
-            {
-                for (int i = 0; i < 6; i++)
-                {
-                    if (m_ShadowFaceRTs[i] && m_ShadowFaceRTs[i].IsCreated())
-                    {
-                        mainSplatMaterial.SetTexture(s_ShadowMapFaceTextureIDs[i], m_ShadowFaceRTs[i]);
-                    }
-                }
-            }
-            // 그 외의 경우 (예: URP인데 shadowFaceTextures가 null로 전달된 경우), 
-            // 셰이더는 이전에 설정된 값이나 전역 값을 사용하거나, 기본값을 사용하게 됩니다.
 
             mainSplatMaterial.SetVector(s_PointLightPositionID_Main, pointLightTransform.position);
             mainSplatMaterial.SetFloat(s_ShadowBiasID_Main, shadowBias);
@@ -523,7 +496,7 @@ namespace GaussianSplatting.Runtime
 
         private Matrix4x4 GetLightViewMatrixForFace(CubemapFace face)
         {
-            // 1. OpenGL 큐브맵 표준에 맞는 LookAt 파라미터 설정
+            // 1. LookAt 파라미터 설정
             // Target: 뷰의 방향
             // Up: 뷰의 상단 방향
             Vector3 targetDirection;
@@ -571,13 +544,8 @@ namespace GaussianSplatting.Runtime
                 pointLightTransform.position + targetDirection, 
                 upDirection
             );
-
-            // 3. Unity의 +Z 전방 뷰 공간을 OpenGL의 -Z 전방 뷰 공간으로 변환
-            // 뷰 공간의 Z 좌표를 뒤집는 변환 행렬을 곱해준다.
-            // 이는 카메라의 Z축을 반전시키는 것과 동일한 효과를 낸다.
-            Matrix4x4 glFixMatrix = Matrix4x4.Scale(new Vector3(1, 1, -1));
-    
-            return glFixMatrix * unityViewMatrix;
+            
+            return unityViewMatrix;
         }
 
         private void CleanupResources()

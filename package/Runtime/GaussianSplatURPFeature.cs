@@ -122,14 +122,12 @@ namespace GaussianSplatting.Runtime
                                 // ShadowRenderer에 6개의 2D TextureHandle을 전달하여 렌더링 명령 기록
                                 data.shadowRenderer.RenderShadowFacesURP(cmd, data.shadowFaceHandles);
                                 
-                                // 6개의 2D 텍스처를 전역 셰이더 변수로 설정
-                                Texture[] resolvedFaceTextures = new Texture[6];
                                 for(int i=0; i<6; ++i)
                                 {
                                     cmd.SetGlobalTexture(s_ShadowMapFaceTextureGlobalIDs_Feature[i], data.shadowFaceHandles[i]);
                                 }
-                                // SetShadowParametersOnMainMaterial은 Texture[]를 받도록 GSSR에서 수정됨
-                                data.shadowRenderer.SetShadowParametersOnMainMaterial(resolvedFaceTextures);
+                                
+                                data.shadowRenderer.SetShadowParametersOnMainMaterial();
                             }
                         });
                     }
