@@ -1,4 +1,4 @@
-_Read this in other languages: [Korean](./readme.md)
+_Read this in other languages: [English](./readme.md)
 ***
 # Unity Gaussian Splatting Shadow Rendering
 
