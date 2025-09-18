@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-Shader "Gaussian Splatting/Render Splats"
+Shader "Gaussian Splatting/Render Splats With Point Shadow"
 {
     SubShader
     {
@@ -25,13 +25,15 @@ struct v2f
 {
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
-    float3 worldPos : TEXCOORD1; // <<< 추가: 프래그먼트의 월드 좌표 (스플랫 중심)
+    float3 worldPos : TEXCOORD1; // for shadow
     float4 vertex : SV_POSITION;
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
+
+float4x4 _ShadowMapFaceMatrixPX, _ShadowMapFaceMatrixNX, _ShadowMapFaceMatrixPY, _ShadowMapFaceMatrixNY, _ShadowMapFaceMatrixPZ, _ShadowMapFaceMatrixNZ;
 
 Texture2D _ShadowMapFacePX; SamplerState sampler_ShadowMapFacePX; // +X
 Texture2D _ShadowMapFaceNX; SamplerState sampler_ShadowMapFaceNX; // -X
@@ -43,7 +45,73 @@ Texture2D _ShadowMapFaceNZ; SamplerState sampler_ShadowMapFaceNZ; // -Z
 float3 _PointLightPosition;    // 광원의 월드 좌표
 float _ShadowBias;             // 그림자 바이어스
 float _LightFarPlaneGS;        // 광원 시점의 Far Plane 거리
-float _LightNearPlaneGS; 
+float _LightNearPlaneGS;       // 광원 시점의 Near Plane 거리
+
+// --- 점광원 그림자 계산 함수 ---
+half SamplePointShadow(float3 worldPos)
+{
+    // --- 1. 광원 벡터 계산 및 변수 초기화 ---
+    float3 lightVec = worldPos - _PointLightPosition;
+    float3 absVec = abs(lightVec);
+    float4 shadowCoord; // 결과를 담을 변수
+
+    // --- 2. 픽셀 위치에 따라 올바른 VP 행렬을 선택하여 광원 시점의 클립 좌표 계산 ---
+    if (absVec.x > absVec.y && absVec.x > absVec.z) // X face
+    {
+        if (lightVec.x > 0)
+            shadowCoord = mul(_ShadowMapFaceMatrixPX, float4(worldPos, 1.0));
+        else
+            shadowCoord = mul(_ShadowMapFaceMatrixNX, float4(worldPos, 1.0));
+    }
+    else if (absVec.y > absVec.z) // Y face
+    {
+        if (lightVec.y > 0)
+            shadowCoord = mul(_ShadowMapFaceMatrixPY, float4(worldPos, 1.0));
+        else
+            shadowCoord = mul(_ShadowMapFaceMatrixNY, float4(worldPos, 1.0));
+    }
+    else // Z face
+    {
+        if (lightVec.z > 0)
+            shadowCoord = mul(_ShadowMapFaceMatrixPZ, float4(worldPos, 1.0));
+        else
+            shadowCoord = mul(_ShadowMapFaceMatrixNZ, float4(worldPos, 1.0));
+    }
+
+    // --- 3. NDC 좌표 및 UV 계산 (모든 페이스에 공통) ---
+    shadowCoord.xyz /= shadowCoord.w;                 // 동차 나누기 -> NDC (-1 ~ 1 범위)
+    float currentDepth = shadowCoord.z;               // 현재 픽셀의 깊이 (D3D에서 0 ~ 1 범위)
+    float2 shadowUV = shadowCoord.xy * 0.5 + 0.5;     // UV 좌표 (0 ~ 1 범위)
+    shadowUV.y = 1.0 - shadowUV.y;                    // D3D 환경을 위한 Y 좌표 반전
+
+    // --- 4. 뎁스맵에서 깊이 값 샘플링 ---
+    float shadowMapDepth = 1.0;
+    if (absVec.x > absVec.y && absVec.x > absVec.z) // X face
+    {
+        if (lightVec.x > 0)
+            shadowMapDepth = _ShadowMapFacePX.Sample(sampler_ShadowMapFacePX, shadowUV).r;
+        else
+            shadowMapDepth = _ShadowMapFaceNX.Sample(sampler_ShadowMapFaceNX, shadowUV).r;
+    }
+    else if (absVec.y > absVec.z) // Y face
+    {
+        if (lightVec.y > 0)
+            shadowMapDepth = _ShadowMapFacePY.Sample(sampler_ShadowMapFacePY, shadowUV).r;
+        else
+            shadowMapDepth = _ShadowMapFaceNY.Sample(sampler_ShadowMapFaceNY, shadowUV).r;
+    }
+    else // Z face
+    {
+        if (lightVec.z > 0)
+            shadowMapDepth = _ShadowMapFacePZ.Sample(sampler_ShadowMapFacePZ, shadowUV).r;
+        else
+            shadowMapDepth = _ShadowMapFaceNZ.Sample(sampler_ShadowMapFaceNZ, shadowUV).r;
+    }
+
+    // --- 5. 깊이 비교 및 최종 그림자 값 반환 ---
+	half shadow = (currentDepth < shadowMapDepth - _ShadowBias) ? 0.2 : 1.0;
+    return shadow;
+}
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -68,7 +136,7 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		quadPos *= 2;
 
 		o.pos = quadPos;
-		o.worldPos = view.centerWorldPos; // <<< 추가된 라인
+        o.worldPos = view.centerWorldPos; // for shadow
 
 		float2 deltaScreenPos = (quadPos.x * view.axis1 + quadPos.y * view.axis2) * 2 / _ScreenParams.xy;
 		o.vertex = centerClipPos;
@@ -88,65 +156,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 	}
 	FlipProjectionIfBackbuffer(o.vertex);
     return o;
-}
-
-float SampleShadowMapFromFaces(float3 lightToFragNormalized, float3 absLightToFragDir)
-{
-    float2 uv;
-    float shadowMapStoredDepth = 1.0; // 기본값: 빛을 받음
-    float recipMajorAxis;
-
-    if (absLightToFragDir.x >= absLightToFragDir.y && absLightToFragDir.x >= absLightToFragDir.z) // X축이 주 축
-    {
-        recipMajorAxis = 1.0 / absLightToFragDir.x;
-        if (lightToFragNormalized.x > 0) { // Positive X
-            uv = float2(-lightToFragNormalized.z * recipMajorAxis, -lightToFragNormalized.y * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFacePX.Sample(sampler_ShadowMapFacePX, uv).r;
-        } else { // Negative X
-            uv = float2(lightToFragNormalized.z * recipMajorAxis, -lightToFragNormalized.y * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFaceNX.Sample(sampler_ShadowMapFaceNX, uv).r;
-        }
-    }
-    else if (absLightToFragDir.y >= absLightToFragDir.x && absLightToFragDir.y >= absLightToFragDir.z) // Y축이 주 축
-    {
-        recipMajorAxis = 1.0 / absLightToFragDir.y;
-        if (lightToFragNormalized.y > 0) { // Positive Y
-            uv = float2(lightToFragNormalized.x * recipMajorAxis, lightToFragNormalized.z * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFacePY.Sample(sampler_ShadowMapFacePY, uv).r;
-        } else { // Negative Y
-            uv = float2(lightToFragNormalized.x * recipMajorAxis, -lightToFragNormalized.z * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFaceNY.Sample(sampler_ShadowMapFaceNY, uv).r;
-        }
-    }
-    else // Z축이 주 축
-    {
-        recipMajorAxis = 1.0 / absLightToFragDir.z;
-        if (lightToFragNormalized.z > 0) { // Positive Z
-            uv = float2(lightToFragNormalized.x * recipMajorAxis, -lightToFragNormalized.y * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFacePZ.Sample(sampler_ShadowMapFacePZ, uv).r;
-        } else { // Negative Z
-            uv = float2(-lightToFragNormalized.x * recipMajorAxis, -lightToFragNormalized.y * recipMajorAxis) * 0.5 + 0.5;
-            shadowMapStoredDepth = _ShadowMapFaceNZ.Sample(sampler_ShadowMapFaceNZ, uv).r;
-        }
-    }
-    return shadowMapStoredDepth;
-}
-
-float LinearizeDeviceDepthToViewZ(float nonLinearDepth01, float nearPlane, float farPlane)
-{
-    // Unity/DirectX 스타일 프로젝션 (NDC z = 0 at near, 1 at far) 기준
-    // 이 공식은 nonLinearDepth01이 이미 0(near)에서 1(far) 범위라고 가정합니다.
-    // viewZ = 1.0 / ( (1.0/near - 1.0/far) * nonLinearDepth01 + 1.0/far )
-    // viewZ = near * far / (near + nonLinearDepth01 * (far - near)) <- 이 공식은 nonLinearDepth01을 역으로 사용
-    // 올바른 공식 중 하나:
-    // Z_ndc = nonLinearDepth01
-    // Z_clip_val_for_w_one = Z_ndc * 2.0 - 1.0; (if projection maps to [-1,1] clip z for w=1)
-    // Z_view = (2.0 * near * far) / (far + near - Z_clip_val_for_w_one * (far - near))
-    // Unity의 경우, 깊이 버퍼 값(0..1)에서 바로 뷰 공간 Z로 가는 공식 (양수):
-    // perspective: 1.0 / ( (1.0/near - 1.0/far) * depth_01_from_buffer + 1.0/far )
-    // 여기서는 문서에 있던 공식을 사용하되, nonLinearDepth01이 이미 0..1 범위라고 가정합니다.
-    // nonLinearDepth01 * 2.0f - 1.0f -> [-1, 1] 범위로 변환
-    return abs((2.0f * nearPlane * farPlane) / (farPlane + nearPlane - (nonLinearDepth01 * 2.0f - 1.0f) * (farPlane - nearPlane)));
 }
 
 half4 frag (v2f i) : SV_Target
@@ -177,27 +186,10 @@ half4 frag (v2f i) : SV_Target
     if (alpha < 1.0/255.0)
         discard;
 
-	// --- 그림자 계산 시작 ---
-    float3 currentWorldPos = i.worldPos.xyz;
-    float3 lightToFragDir = currentWorldPos - _PointLightPosition;
-    float currentDepthFromLightLinear = length(lightToFragDir); // 현재 프래그먼트의 실제 선형 깊이
-    float3 normalizedLightToFragDir = normalize(lightToFragDir);
-    float3 absLightToFragDir = abs(normalizedLightToFragDir);
-
-    float shadowMapHardwareDepth01 = SampleShadowMapFromFaces(normalizedLightToFragDir, absLightToFragDir); // 0~1 범위의 비선형 하드웨어 뎁스
-
-    // 섀도우 맵에서 읽은 비선형 뎁스를 선형 뷰 공간 Z 거리로 변환
-    float occluderDepthLinear = LinearizeDeviceDepthToViewZ(shadowMapHardwareDepth01, _LightNearPlaneGS, _LightFarPlaneGS);
-
-    half shadowFactor = 1.0h; 
-    // 이제 두 선형 깊이 값을 비교합니다.
-    if (currentDepthFromLightLinear > occluderDepthLinear + _ShadowBias)
-    {
-        shadowFactor = 0.3h; // 그림자 감쇠값 (예: 0.3)
-    }
-    // --- 그림자 계산 종료 ---
-	
-    half4 res = half4(i.col.rgb * shadowFactor * alpha, alpha);
+    half shadow = SamplePointShadow(i.worldPos);
+    half3 finalColor = i.col.rgb * shadow;
+    
+    half4 res = half4(finalColor * alpha, alpha);
     return res;
 }
 ENDCG

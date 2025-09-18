@@ -127,7 +127,7 @@ namespace GaussianSplatting.Runtime
                                     cmd.SetGlobalTexture(s_ShadowMapFaceTextureGlobalIDs_Feature[i], data.shadowFaceHandles[i]);
                                 }
                                 
-                                data.shadowRenderer.SetShadowParametersOnMainMaterial();
+                                data.shadowRenderer.SetGlobalShadowParameters();
                             }
                         });
                     }

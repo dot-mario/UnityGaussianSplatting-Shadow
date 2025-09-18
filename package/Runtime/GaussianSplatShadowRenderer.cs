@@ -23,6 +23,10 @@ namespace GaussianSplatting.Runtime
         public float lightNearPlane = 0.5f;
         public float lightFarPlane = 100.0f;
         public float shadowBias = 0.005f;
+        
+        [Range(0.0f, 1.0f)]
+        [Tooltip("그림자 맵 생성 시 이 알파 값보다 낮은 스플랫은 그리지 않습니다.")]
+        public float shadowAlphaCutoff = 0.2f;
 
         [Header("셰이더 참조 (Shader Reference)")]
         public Shader shadowCasterShader; // 필수
@@ -53,12 +57,19 @@ namespace GaussianSplatting.Runtime
         private static readonly int s_LightSplatViewDataOutputID = Shader.PropertyToID("_LightSplatViewDataOutput");
         private static readonly int s_SharedLightDataInputID = Shader.PropertyToID("_SharedLightDataInput");
         private static readonly int s_SharedLightDataOutputID = Shader.PropertyToID("_SharedLightDataOutput");
+        
+        private static readonly int s_ShadowAlphaCutoffID = Shader.PropertyToID("_ShadowAlphaCutoff");
 
         // 주 스플랫 셰이더에 전달할 6개의 2D 섀도우 맵 텍스처 이름 ID
         private static readonly int[] s_ShadowMapFaceTextureIDs = new int[6] {
             Shader.PropertyToID("_ShadowMapFacePX"), Shader.PropertyToID("_ShadowMapFaceNX"),
             Shader.PropertyToID("_ShadowMapFacePY"), Shader.PropertyToID("_ShadowMapFaceNY"),
             Shader.PropertyToID("_ShadowMapFacePZ"), Shader.PropertyToID("_ShadowMapFaceNZ")
+        };
+        private static readonly int[] s_ShadowMapFaceMatrixIDs = new int[6] {
+            Shader.PropertyToID("_ShadowMapFaceMatrixPX"), Shader.PropertyToID("_ShadowMapFaceMatrixNX"),
+            Shader.PropertyToID("_ShadowMapFaceMatrixPY"), Shader.PropertyToID("_ShadowMapFaceMatrixNY"),
+            Shader.PropertyToID("_ShadowMapFaceMatrixPZ"), Shader.PropertyToID("_ShadowMapFaceMatrixNZ")
         };
         // 주 스플랫 셰이더에 전달할 광원 파라미터 ID
         private static readonly int s_PointLightPositionID_Main = Shader.PropertyToID("_PointLightPosition");
@@ -143,10 +154,10 @@ namespace GaussianSplatting.Runtime
 
             if (IsRenderNeeded())
             {
-                RenderShadowFacesNonURP(); 
+                // RenderShadowFacesNonURP(); 
             }
             // 비URP 시에도 주 렌더러의 머티리얼에 텍스처와 파라미터 설정
-            SetShadowParametersOnMainMaterial();
+            SetGlobalShadowParameters();
         }
         
         public bool IsRenderNeeded()
@@ -228,7 +239,8 @@ namespace GaussianSplatting.Runtime
             
             m_GaussianSplatRenderer.SetAssetDataOnCS(cmd, GaussianSplatRenderer.KernelIndices.CalcLightViewData);
 
-            Matrix4x4 lightProjectionMatrix = GL.GetGPUProjectionMatrix(Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane), true);
+            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
+            lightProjectionMatrix = GL.GetGPUProjectionMatrix(lightProjectionMatrix, true);
 
             // 루프 외부에서 설정 가능한 컴퓨트 셰이더 파라미터 (CSCalcLightViewDataKernel용)
             cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
@@ -267,17 +279,18 @@ namespace GaussianSplatting.Runtime
 
                 MaterialPropertyBlock mpb = new MaterialPropertyBlock();
                 mpb.Clear();
-                m_GaussianSplatRenderer.SetAssetDataOnMaterial(mpb);
                 mpb.SetVector(s_LightScreenParamsID_Shadow, new Vector4(shadowCubemapResolution, shadowCubemapResolution, 0, 0));
                 mpb.SetBuffer(s_LightSplatViewDataOutputID, m_LightViewDataBuffer);
-                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer,   m_GaussianSplatRenderer.m_GpuSortKeys);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale,      m_GaussianSplatRenderer.m_SplatScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale,m_GaussianSplatRenderer.m_OpacityScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize,       m_GaussianSplatRenderer.m_PointDisplaySize);
                 
+                // 인스펙터에서 설정한 알파 컷오프 값을 MPB에 설정
+                mpb.SetFloat(s_ShadowAlphaCutoffID, shadowAlphaCutoff);
+                
                 cmd.DrawProcedural(
-                    m_GaussianSplatRenderer.m_GpuIndexBuffer, 
-                    m_GaussianSplatRenderer.transform.localToWorldMatrix,
+                    m_GaussianSplatRenderer.m_GpuIndexBuffer,
+                    m_GaussianSplatRenderer.transform.localToWorldMatrix, // 이건 진짜 무슨 상관인지 모르겠네
                     m_ShadowCasterMaterial, 
                     0, 
                     MeshTopology.Triangles, 
@@ -324,7 +337,8 @@ namespace GaussianSplatting.Runtime
                 CubemapFace face = (CubemapFace)i;
                 Matrix4x4 currentLightViewMatrix = GetLightViewMatrixForFace(face);
 
-                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightModelViewMatrixID, currentLightViewMatrix);
+                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightViewMatrixID, currentLightViewMatrix);
+                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightModelViewMatrixID, currentLightViewMatrix * m_GaussianSplatRenderer.transform.localToWorldMatrix);
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightProjMatrixID, lightProjectionMatrix);
                 cmd.SetComputeVectorParam(m_SplatUtilitiesCS, s_LightScreenParamsID_Shadow, new Vector4(shadowCubemapResolution, shadowCubemapResolution, 0, 0));
                 
@@ -357,15 +371,31 @@ namespace GaussianSplatting.Runtime
             return GraphicsSettings.currentRenderPipeline is UniversalRenderPipelineAsset;
         }
 
-        public void SetShadowParametersOnMainMaterial()
+        public void SetGlobalShadowParameters()
         {
-            if (!m_GaussianSplatRenderer || !m_GaussianSplatRenderer.m_MatSplats) return;
-            Material mainSplatMaterial = m_GaussianSplatRenderer.m_MatSplats;
+            // 셰이더 전역 변수를 설정하므로 특정 머티리얼이 필요하지 않음
+            // if (!m_GaussianSplatRenderer || !m_GaussianSplatRenderer.m_MatSplats || !pointLightTransform) return;
+            if (!pointLightTransform) return;
 
-            mainSplatMaterial.SetVector(s_PointLightPositionID_Main, pointLightTransform.position);
-            mainSplatMaterial.SetFloat(s_ShadowBiasID_Main, shadowBias);
-            mainSplatMaterial.SetFloat(s_LightFarPlaneID_Main, lightFarPlane);
-            mainSplatMaterial.SetFloat(s_LightNearPlaneID_Main, lightNearPlane);
+            // 1. 기존 파라미터 설정
+            Shader.SetGlobalVector(s_PointLightPositionID_Main, pointLightTransform.position);
+            Shader.SetGlobalFloat(s_ShadowBiasID_Main, shadowBias);
+            Shader.SetGlobalFloat(s_LightFarPlaneID_Main, lightFarPlane);
+            Shader.SetGlobalFloat(s_LightNearPlaneID_Main, lightNearPlane);
+            
+            // 2. 6방향 View-Projection 행렬 계산 및 전역 변수 설정
+            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
+            lightProjectionMatrix = GL.GetGPUProjectionMatrix(lightProjectionMatrix, true);
+
+            for (int i = 0; i < 6; ++i)
+            {
+                CubemapFace face = (CubemapFace)i;
+                Matrix4x4 lightViewMatrix = GetLightViewMatrixForFace(face);
+                Matrix4x4 vpMatrix = lightProjectionMatrix * lightViewMatrix;
+
+                // 전역 행렬 변수로 설정
+                Shader.SetGlobalMatrix(s_ShadowMapFaceMatrixIDs[i], vpMatrix);
+            }
         }
         
         private bool HasSettingsChanged()
@@ -494,58 +524,68 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        // UNITY_MATRIX_V 대체
+        // Camera.worldToCameraMatrix는 카메라의 전방이 -Z축이 되는 OpenGL 표준 규칙을 따름
+        // https://discussions.unity.com/t/unity-custom-camera-view-matrix-in-shader/533800/5
         private Matrix4x4 GetLightViewMatrixForFace(CubemapFace face)
         {
-            // 1. LookAt 파라미터 설정
-            // Target: 뷰의 방향
-            // Up: 뷰의 상단 방향
-            Vector3 targetDirection;
-            Vector3 upDirection;
-
+            Vector3 right, up, forward;
+    
+            // Unity 큐브맵 렌더링 표준 좌표계 기준
             switch (face)
             {
-                // Target: +X (Right), Up: -Y
-                case CubemapFace.PositiveX: 
-                    targetDirection = Vector3.right;
-                    upDirection = Vector3.down;
+                case CubemapFace.PositiveX: // +X
+                    forward = Vector3.right;
+                    up      = Vector3.down;
+                    right   = Vector3.back;
                     break;
-                // Target: -X (Left), Up: -Y
-                case CubemapFace.NegativeX:
-                    targetDirection = Vector3.left;
-                    upDirection = Vector3.down;
+                case CubemapFace.NegativeX: // -X
+                    forward = Vector3.left;
+                    up      = Vector3.down;
+                    right   = Vector3.forward;
                     break;
-                // Target: +Y (Up), Up: +Z
-                case CubemapFace.PositiveY:
-                    targetDirection = Vector3.up;
-                    upDirection = Vector3.forward;
+                case CubemapFace.PositiveY: // +Y
+                    forward = Vector3.up;
+                    up      = Vector3.forward;
+                    right   = Vector3.left;
                     break;
-                // Target: -Y (Down), Up: -Z
-                case CubemapFace.NegativeY:
-                    targetDirection = Vector3.down;
-                    upDirection = Vector3.back;
+                case CubemapFace.NegativeY: // -Y
+                    forward = Vector3.down;
+                    up      = Vector3.back;
+                    right   = Vector3.right;
                     break;
-                // Target: +Z (Forward), Up: -Y
-                case CubemapFace.PositiveZ:
-                    targetDirection = Vector3.forward;
-                    upDirection = Vector3.down;
+                case CubemapFace.PositiveZ: // +Z
+                    forward = Vector3.forward;
+                    up      = Vector3.down;
+                    right   = Vector3.right;
                     break;
-                // Target: -Z (Back), Up: -Y
-                case CubemapFace.NegativeZ:
-                    targetDirection = Vector3.back;
-                    upDirection = Vector3.down;
+                case CubemapFace.NegativeZ: // -Z
+                    forward = Vector3.back;
+                    up      = Vector3.down;
+                    right   = Vector3.left;
                     break;
                 default:
                     return Matrix4x4.identity;
             }
 
-            // 2. Unity의 LookAt 함수를 사용하여 View 행렬 생성 (+Z가 전방인 뷰 공간)
-            Matrix4x4 unityViewMatrix = Matrix4x4.LookAt(
-                pointLightTransform.position, 
-                pointLightTransform.position + targetDirection, 
-                upDirection
-            );
-            
-            return unityViewMatrix;
+            // UNITY_MATRIX_V와 동일한 구조의 View Matrix를 직접 계산
+            Vector3 pos = pointLightTransform.position;
+            Matrix4x4 matrix = new Matrix4x4();
+    
+            // Rotation part (좌표축 변환)
+            // m20 : Unity/OpenGL은 -Z를 바라보므로 forward에 - 붙임
+            matrix.m00 = right.x;    matrix.m01 = right.y;    matrix.m02 = right.z;
+            matrix.m10 = up.x;       matrix.m11 = up.y;       matrix.m12 = up.z;
+            matrix.m20 = -forward.x; matrix.m21 = -forward.y; matrix.m22 = -forward.z;
+
+            // Translation part (원점 이동)
+            matrix.m03 = -Vector3.Dot(right, pos);
+            matrix.m13 = -Vector3.Dot(up, pos);
+            matrix.m23 = Vector3.Dot(forward, pos); // -(-forward.dot(pos)) 이므로 +가 됨
+
+            matrix.m33 = 1.0f;
+
+            return matrix;
         }
 
         private void CleanupResources()

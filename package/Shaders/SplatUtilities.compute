@@ -965,11 +965,6 @@ void CSCalcLightViewData (uint3 id : SV_DispatchThreadID)
         // lightView.opacity = min(splat.opacity * _SplatOpacityScale, 65000.0h);
         lightView.opacity = sharedLightData.opacity; // 재사용
     }
-    else // 컬링
-    {
-        lightView.centerClipPos = float4(0,0,0,-1); // w <= 0 이면 컬링됨
-        lightView.opacity = 0;
-    }
 
     // 10. 최종 결과 저장
     _LightSplatViewDataOutput[idx] = lightView;
