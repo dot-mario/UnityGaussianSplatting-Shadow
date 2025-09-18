@@ -17,6 +17,11 @@ namespace GaussianSplatting.Runtime
     {
         [FormerlySerializedAs("pointLightPosition")] [Header("광원 설정 (Light Settings)")]
         public Transform pointLightTransform;
+        
+        [Range(0.0f, 1.0f), Tooltip("그림자가 없는 영역의 밝기")]
+        public float lightBrightness = 1.0f;
+        [Range(0.0f, 1.0f), Tooltip("그림자가 진 영역의 밝기")]
+        public float shadowBrightness = 0.2f;
 
         [Header("그림자 맵 설정 (Shadow Map Settings)")]
         public int shadowCubemapResolution = 1024;
@@ -76,6 +81,9 @@ namespace GaussianSplatting.Runtime
         private static readonly int s_ShadowBiasID_Main = Shader.PropertyToID("_ShadowBias");
         private static readonly int s_LightFarPlaneID_Main = Shader.PropertyToID("_LightFarPlaneGS");
         private static readonly int s_LightNearPlaneID_Main = Shader.PropertyToID("_LightNearPlaneGS");
+        
+        private static readonly int s_LightBrightnessID_Main = Shader.PropertyToID("_LightBrightness");
+        private static readonly int s_ShadowBrightnessID_Main = Shader.PropertyToID("_ShadowBrightness");
 
         private ComputeShader m_SplatUtilitiesCS;
         private GraphicsBuffer m_LightViewDataBuffer;
@@ -382,6 +390,9 @@ namespace GaussianSplatting.Runtime
             Shader.SetGlobalFloat(s_ShadowBiasID_Main, shadowBias);
             Shader.SetGlobalFloat(s_LightFarPlaneID_Main, lightFarPlane);
             Shader.SetGlobalFloat(s_LightNearPlaneID_Main, lightNearPlane);
+            
+            Shader.SetGlobalFloat(s_LightBrightnessID_Main, lightBrightness);
+            Shader.SetGlobalFloat(s_ShadowBrightnessID_Main, shadowBrightness);
             
             // 2. 6방향 View-Projection 행렬 계산 및 전역 변수 설정
             Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);

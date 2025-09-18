@@ -47,8 +47,11 @@ float _ShadowBias;             // 그림자 바이어스
 float _LightFarPlaneGS;        // 광원 시점의 Far Plane 거리
 float _LightNearPlaneGS;       // 광원 시점의 Near Plane 거리
 
+float _LightBrightness;        // 빛을 받는 영역의 밝기
+float _ShadowBrightness;       // 그림자 영역의 밝기
+
 // --- 점광원 그림자 계산 함수 ---
-half SamplePointShadow(float3 worldPos)
+bool SamplePointShadow(float3 worldPos)
 {
     // --- 1. 광원 벡터 계산 및 변수 초기화 ---
     float3 lightVec = worldPos - _PointLightPosition;
@@ -108,9 +111,9 @@ half SamplePointShadow(float3 worldPos)
             shadowMapDepth = _ShadowMapFaceNZ.Sample(sampler_ShadowMapFaceNZ, shadowUV).r;
     }
 
-    // --- 5. 깊이 비교 및 최종 그림자 값 반환 ---
-	half shadow = (currentDepth < shadowMapDepth - _ShadowBias) ? 0.2 : 1.0;
-    return shadow;
+    // --- 5. 깊이 비교 및 최종 그림자 판단 ---
+    bool visibility = (currentDepth >= shadowMapDepth - _ShadowBias);
+	return visibility;
 }
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
@@ -186,8 +189,9 @@ half4 frag (v2f i) : SV_Target
     if (alpha < 1.0/255.0)
         discard;
 
-    half shadow = SamplePointShadow(i.worldPos);
-    half3 finalColor = i.col.rgb * shadow;
+    half visibility = SamplePointShadow(i.worldPos);
+	half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility);
+    half3 finalColor = i.col.rgb * lightIntensity;
     
     half4 res = half4(finalColor * alpha, alpha);
     return res;
