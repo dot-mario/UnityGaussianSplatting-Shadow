@@ -1,20 +1,23 @@
-# R-2. Gaussian Splat Shadow Rendering TDD
+# Unity Gaussian Splatting Shadow Rendering
 
-이 브랜치는 예전의 시도에 대한 코드입니다.
+Unity URP(Universal Render Pipeline) 환경에서 Gaussian Splatting 모델에 동적 포인트 라이트 그림자를 구현한 렌더링 시스템이다.
 
-## 현재 문제 상황:
-저는 Unity URP(Universal Render Pipeline) 환경에서 Gaussian Splatting 모델에 동적 포인트 라이트 그림자를 구현하고 있습니다. 그림자 생성 방식은 포인트 라이트 위치에서 6방향으로 뎁스 맵(Depth Map)을 렌더링하여 6개의 개별 2D 텍스처에 저장한 후, 주 렌더링 패스에서 이 텍스처들을 샘플링하여 그림자를 적용하는 것입니다.
-하지만 현재 6개의 뎁스 텍스처에 올바른 6방향 뷰가 렌더링되지 않고, 잘못된 결과가 그려지는 문제가 발생하고 있습니다. 주 렌더링 패스(RenderGaussianSplats.shader)는 정상적으로 동작하지만, 그림자 맵을 생성하는 섀도우 캐스터 패스(ShadowCasterSplat.shader)에 문제가 있는 것으로 보입니다. 특히, 각 큐브맵 면에 대한 뷰 변환을 계산하고 적용하는 컴퓨트 셰이더 단계에서 좌표계 문제가 있는 것으로 강력히 의심됩니다.
+## TL;DR
+Unity URP 환경에서 Gaussian Splatting 모델의 동적 포인트 라이트 그림자 구현이 완료되었다. 포인트 라이트 위치에서 6방향으로 뎁스 맵을 렌더링하여 6개의 개별 2D 텍스처에 저장한 후, 주 렌더링 패스에서 이를 샘플링하여 그림자를 적용한다.
 
 ### 핵심 파이프라인:
-1. CSCalcSharedLightData (Compute Shader): 6번의 렌더링 루프 밖에서 한 번만 실행됩니다. 스플랫의 로컬 좌표, 월드 좌표, 3D 공분산 등 재사용 가능한 데이터를 계산하여 SharedLightData 버퍼에 저장합니다.
-2. CSCalcLightViewData (Compute Shader): 큐브맵의 6개 면에 대해 각각 루프를 돌며 실행됩니다.
-    * C#에서 현재 면에 맞는 _LightModelViewMatrix와 _LightProjMatrix를 전달받습니다.
-    * SharedLightData 버퍼를 입력으로 받아, 스플랫의 최종 클립 공간 위치와 화면상 모양(2D 타원 축)을 계산하여 LightViewData 버퍼에 저장합니다.
-3. ShadowCasterSplat.shader (Vertex/Fragment Shader):
-    * LightViewData 버퍼를 읽어 각 스플랫을 뎁스 텍스처에 렌더링(DrawProcedural)하여 깊이 값을 기록합니다.
+1. **CSCalcSharedLightData (Compute Shader)**: 6번의 렌더링 루프 밖에서 한 번만 실행된다. 스플랫의 로컬 좌표, 월드 좌표, 3D 공분산 등 재사용 가능한 데이터를 계산하여 SharedLightData 버퍼에 저장한다.
+2. **CSCalcLightViewData (Compute Shader)**: 큐브맵의 6개 면에 대해 각각 루프를 돌며 실행된다.
+    * C#에서 현재 면에 맞는 올바른 GPU 규칙을 따른 _LightViewMatrix와 _LightProjMatrix를 전달받는다.
+    * SharedLightData 버퍼를 입력으로 받아, 스플랫의 최종 클립 공간 위치와 화면상 모양(2D 타원 축)을 계산하여 LightViewData 버퍼에 저장한다.
+3. **ShadowCasterSplat.shader (Vertex/Fragment Shader)**:
+    * LightViewData 버퍼를 읽어 각 스플랫을 뎁스 텍스처에 렌더링(DrawProcedural)하여 깊이 값을 기록한다.
 
-CSCalcLightViewData 커널이 6개의 다른 _LightModelViewMatrix를 받음에도 불구하고, 결과적으로 6개의 뎁스 텍스처가 모두 비슷하게 잘못 렌더링됩니다. 이는 CSCalcLightViewData 내부의 좌표 변환 로직이 _LightModelViewMatrix를 올바르게 활용하지 못하고 있거나, 잘못된 값을 커널에 전달 하는 것으로 시사됩니다.
+### 해결된 핵심 문제:
+기존 문제는 `GaussianSplatShadowRenderer.cs`에서 view matrix와 projection matrix를 생성할 때 GPU 규칙이 아닌 C# Unity 규칙을 따라 계산했기 때문에 발생했다. 이는 다음과 같이 해결되었다:
+- **View Matrix**: UNITY_MATRIX_V와 동일한 구조로 직접 계산하여 GPU 좌표계 규칙을 준수
+- **Projection Matrix**: `GL.GetGPUProjectionMatrix()`를 올바른 순서로 적용하여 GPU 규칙에 맞게 변환
+- **전역 변수 사용**: 셰이더 전역 변수를 통한 더 효율적인 파라미터 전달
 
 ```mermaid
 ---
@@ -36,7 +39,7 @@ title: flow chart
 
 graph TD
     accTitle: 가우시안 스플래팅 그림자 파이프라인
-    accDescr: 2단계로 구성된 가우시안 스플래팅의 동적 그림자 생성 과정. 1단계는 섀도우 맵 생성, 2단계는 주 렌더링 및 그림자 적용입니다.
+    accDescr: 2단계로 구성된 가우시안 스플래팅의 동적 그림자 생성 과정. 1단계는 섀도우 맵 생성, 2단계는 주 렌더링 및 그림자 적용이다.
 
     %% ==========================================
     %% 단계 1: 섀도우 맵 생성
@@ -112,8 +115,8 @@ graph TD
 
 **주요 구성 요소:**
 
-- **`GaussianSplatRenderer.cs`**: 개별 가우시안 스플랫 에셋의 렌더링을 담당하는 주 컴포넌트.
-- **`GaussianSplatShadowRenderer.cs`**: 특정 `GaussianSplatRenderer`에 연결되어 포인트 라이트의 섀도우 맵 생성을 전담하는 컴포넌트. 6개의 2D 뎁스 텍스처를 관리하고 렌더링 명령을 생성한다.
+- **`GaussianSplatRenderer.cs`**: 개별 가우시안 스플랫 에셋의 렌더링을 담당하는 주 컴포넌트다.
+- **`GaussianSplatShadowRenderer.cs`**: 특정 `GaussianSplatRenderer`에 연결되어 포인트 라이트의 섀도우 맵 생성을 전담하는 컴포넌트다. 6개의 2D 뎁스 텍스처를 관리하고 렌더링 명령을 생성한다.
 - **`GaussianSplatURPFeature.cs`**: URP의 `ScriptableRendererFeature`로, 렌더 그래프(Render Graph) 내에 섀도우 맵 생성 패스와 주 스플랫 렌더링 패스를 삽입하고 관리한다.
 - **`SplatUtilities.compute` (Compute Shader)**: 스플랫 데이터의 GPU 기반 처리를 담당한다.
     - `CSCalcSharedLightData`: 광원과 무관하게 미리 계산될 수 있는 스플랫 데이터(위치, 3D 공분산, 원본 불투명도 등)를 준비한다.
@@ -134,17 +137,21 @@ graph TD
 - **컴퓨트 셰이더 및 렌더링 준비**:
     - `EnsureGpuResourcesForCompute()`: `m_LightViewDataBuffer`와 `m_SharedLightDataBuffer` 등 컴퓨트 셰이더에 필요한 GPU 버퍼를 준비한다.
     - `EnsureShadowCasterMaterial()`: `shadowCasterShader`를 사용하는 머티리얼(`m_ShadowCasterMaterial`)을 준비한다.
+- **개선된 View/Projection Matrix 계산**:
+    - **GPU 호환 Projection Matrix**: `GL.GetGPUProjectionMatrix()`를 올바른 순서로 적용하여 GPU 규칙에 맞게 변환
+    - **정확한 View Matrix**: `GetLightViewMatrixForFace()`에서 UNITY_MATRIX_V와 동일한 구조로 직접 계산
+    - **전역 셰이더 변수**: `SetGlobalShadowParameters()`를 통해 모든 그림자 관련 파라미터를 전역 변수로 설정
 - **URP 연동 메서드**:
     - `RenderShadowFacesURP(CommandBuffer cmd, TextureHandle[] faceTextureHandles)`: URP Feature로부터 `CommandBuffer`와 6개의 2D `TextureHandle` 배열을 전달받는다.
         1. `DispatchSharedDataKernel(cmd)`: `CSCalcSharedLightData` 커널을 디스패치하여 모든 스플랫에 대한 광원 공통 데이터를 미리 계산하고 `m_SharedLightDataBuffer`에 저장한다.
         2. 루프 (6회 반복, 각 큐브맵 면에 대해):
-            - `GetLightViewMatrixForFace((CubemapFace)i)`: 현재 면에 대한 광원의 뷰 행렬을 계산한다.
-            - 프로젝션 행렬 생성: `Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane)`.
-            - 컴퓨트 셰이더 파라미터 설정: `_LightViewMatrix`, `_LightProjMatrix`, `_LightScreenParams` 등을 `CSCalcLightViewData` 커널에 설정한다.
+            - `GetLightViewMatrixForFace((CubemapFace)i)`: 현재 면에 대한 **올바른 GPU 규칙을 따른** 광원의 뷰 행렬을 계산한다.
+            - **GPU 호환 프로젝션 행렬**: `GL.GetGPUProjectionMatrix(Matrix4x4.Perspective(...), true)`로 적용.
+            - 컴퓨트 셰이더 파라미터 설정: `_LightViewMatrix`, `_LightModelViewMatrix`, `_LightProjMatrix`, `_LightScreenParams` 등을 `CSCalcLightViewData` 커널에 설정한다.
             - `CSCalcLightViewData` 커널 디스패치: `m_SharedLightDataBuffer`를 입력으로 받아, 현재 면에 대한 `LightViewData`를 계산하고 `m_LightViewDataBuffer`에 저장한다.
             - `cmd.SetRenderTarget(faceTextureHandles[i])`: URP Feature가 제공한 i번째 2D `TextureHandle`을 렌더 타겟으로 설정한다.
             - `cmd.ClearRenderTarget(true, false, Color.black, 1.0f)`: 뎁스 버퍼만 1.0 (먼 값)으로 클리어한다.
-            - `m_ShadowCasterMaterial`에 필요한 버퍼(`_LightSplatViewDataOutput`) 및 유니폼 설정.
+            - `m_ShadowCasterMaterial`에 필요한 버퍼(`_LightSplatViewDataOutput`) 및 유니폼 설정에 `shadowAlphaCutoff` 추가.
             - `cmd.DrawProcedural(...)`: `ShadowCasterSplat.shader`를 사용하여 현재 렌더 타겟(i번째 2D 뎁스 텍스처)에 스플랫을 렌더링한다.
 - **기타**: `IsRenderNeeded()`, `MarkShadowsDirty()`, `HasSettingsChanged()`, `UpdatePreviousSettings()` 등 상태 관리 메서드.
 
@@ -217,33 +224,33 @@ graph TD
 - **프래그먼트 셰이더 (`frag`)**:
     1. 기존 로직대로 스플랫의 기본 색상(`calculatedColor`)과 모양 알파(`shapeAlpha`), 최종 알파(`finalAlpha`)를 계산하고, 선택된 스플랫 처리 및 `discard` 로직을 수행한다.
     2. **그림자 계산**:
-        - `currentWorldPos = i.worldPos.xyz`: 현재 프래그먼트(스플랫 중심)의 월드 좌표.
-        - `lightToFragDir = currentWorldPos - _PointLightPosition`: 광원에서 프래그먼트로 향하는 벡터.
-        - `currentDepthFromLightLinear = length(lightToFragDir)`: 광원으로부터의 실제 선형 거리.
-        - `normalizedLightToFragDir = normalize(lightToFragDir)`: 정규화된 방향 벡터.
-        - `absLightToFragDir = abs(normalizedLightToFragDir)`.
-        - `shadowMapHardwareDepth01 = SampleShadowMapFromFaces(normalizedLightToFragDir, absLightToFragDir)`: 헬퍼 함수를 호출하여, 3D 방향에 맞는 2D 섀도우 맵 면을 선택하고 해당 면의 UV를 계산하여 0~1 범위의 비선형 하드웨어 뎁스 값을 샘플링한다.
-        - `occluderDepthLinear = LinearizeDeviceDepthToViewZ(shadowMapHardwareDepth01, _LightNearPlaneGS, _LightFarPlaneGS)`: 샘플링된 비선형 뎁스 값을 선형 뷰 공간 Z 거리로 변환한다.
-        - `shadowFactor = 1.0h; if (currentDepthFromLightLinear > occluderDepthLinear + _ShadowBias) { shadowFactor = 0.3h; }`: 현재 프래그먼트의 선형 깊이와 그림자 맵의 선형화된 깊이를 비교하여 그림자 계수를 결정한다. (0.3h는 그림자 영역의 밝기 예시)
+        - `half shadow = SamplePointShadow(i.worldPos)`: 새로운 통합 함수를 호출하여 점광원 그림자 값을 계산한다.
+        - 이 함수는 광원의 6개 View-Projection 행렬(`_ShadowMapFaceMatrixPX` 등)을 직접 사용하여 정확한 그림자 계산을 수행한다.
+        - 픽셀 위치에 따라 올바른 VP 행렬을 선택하고, NDC 좌표 변환 및 UV 계산을 통해 해당 섀도우 맵에서 깊이 비교를 수행한다.
     3. **최종 색상 적용**:
-        - `calculatedColor *= shadowFactor;`: 계산된 그림자 계수를 스플랫 색상에 곱한다.
-        - `return half4(calculatedColor, finalAlpha);`: Non-Premultiplied Alpha 형식으로 최종 색상과 알파를 출력한다. (블렌딩 모드 `Blend OneMinusDstAlpha One`과 일치)
+        - `half3 finalColor = i.col.rgb * shadow`: 계산된 그림자 계수를 스플랫 색상에 곱한다.
+        - `return half4(finalColor * alpha, alpha)`: Non-Premultiplied Alpha 형식으로 최종 색상과 알파를 출력한다. (블렌딩 모드 `Blend OneMinusDstAlpha One`과 일치)
 
-### 3.2. `SampleShadowMapFromFaces` 함수 (HLSL, "**RenderGaussianSplats.shader**" 내)
+### 3.2. `SamplePointShadow` 함수 (HLSL, "**RenderGaussianSplats.shader**" 내)
 
-- 입력: `lightToFragNormalized`, `absLightToFragDir`.
-- 작업:
-    1. `absLightToFragDir`의 x, y, z 중 가장 큰 성분을 기준으로 주 축(major axis)을 결정하여 6개의 큐브맵 면 중 어떤 면에 해당하는지 판단한다.
-    2. 선택된 면의 좌표계 규칙에 따라, `lightToFragNormalized`의 나머지 두 성분과 `recipMajorAxis`를 사용하여 해당 면 위의 2D 좌표(-1~1 범위)를 계산한다.
-    3. 계산된 2D 좌표를 `0.5 + 0.5` 하여 0~1 범위의 UV 좌표로 변환한다.
-    4. 해당 면에 대응하는 `Texture2D` 유니폼(예: `_ShadowMapFacePX`)과 샘플러를 사용하여 UV 위치에서 뎁스 값(R 채널)을 샘플링하여 반환한다.
+**개선된 점광원 그림자 계산 함수**
 
-### 3.3. `LinearizeDeviceDepthToViewZ` 함수 (HLSL, "**RenderGaussianSplats.shader**" 내)
+- **입력**: `float3 worldPos` (현재 프래그먼트의 월드 좌표)
+- **작업**:
+    1. **광원 벡터 계산**: `lightVec = worldPos - _PointLightPosition`으로 광원에서 픽셀로의 벡터 계산
+    2. **큐브맵 면 선택**: `absVec = abs(lightVec)`의 최대 성분을 기준으로 X/Y/Z 면 중 적절한 면 선택
+    3. **VP 행렬 적용**: 선택된 면에 해당하는 View-Projection 행렬(`_ShadowMapFaceMatrixPX` 등)을 사용하여 `shadowCoord = mul(vpMatrix, float4(worldPos, 1.0))` 계산
+    4. **NDC 좌표 변환**: `shadowCoord.xyz /= shadowCoord.w`로 동차 나누기 수행하여 NDC 좌표 획득
+    5. **UV 좌표 계산**: NDC 좌표를 0~1 범위의 UV로 변환하고 D3D 환경을 위한 Y 좌표 반전 적용
+    6. **깊이 비교**: 해당 섀도우 맵에서 깊이 값을 샘플링하고 현재 픽셀의 깊이와 비교하여 그림자 여부 결정
+- **반환값**: `half shadow` (1.0 = 빛을 받음, 0.2 = 그림자 영역)
 
-- 입력: `nonLinearDepth01` (섀도우 맵에서 읽은 0~1 범위의 비선형 하드웨어 뎁스), `nearPlane` (`_LightNearPlaneGS`), `farPlane` (`_LightFarPlaneGS`).
-- 작업: Unity/DirectX 스타일 프로젝션 기준의 표준 공식을 사용하여 비선형 뎁스 값을 선형적인 뷰 공간 Z 거리(양수)로 변환하여 반환한다.
+**주요 개선 사항**:
+- VP 행렬을 직접 사용하여 더 정확한 좌표 변환
+- 복잡한 UV 계산 로직 단순화
+- 깊이 값 선형화 과정 제거로 성능 향상
 
-### 3.4. `GaussianSplatURPFeature.cs` (메인 패스 부분)
+### 3.3. `GaussianSplatURPFeature.cs` (메인 패스 부분)
 
 - 섀도우 패스에서 `SetGlobalTexture`로 설정된 6개의 2D 섀도우 맵 텍스처와, `SetShadowParametersOnMainMaterial`을 통해 주 스플랫 머티리얼에 설정된 기타 그림자 유니폼(`_PointLightPosition`, `_ShadowBias` 등)을 사용하여 `GaussianSplatRenderSystem.instance.SortAndRenderSplats()`를 호출한다.
 - `SortAndRenderSplats` 함수는 "Render Splats" 셰이더를 사용하여 스플랫을 렌더링하며, 이때 프래그먼트 셰이더는 위에서 설명한 그림자 계산 로직을 수행한다.
@@ -265,17 +272,34 @@ graph TD
     - `ShadowCasterSplat.shader`: 광원 시점에서 스플랫을 2D 뎁스 텍스처에 그려 깊이 정보를 기록한다.
     - `RenderGaussianSplats.shader` 셰이더: 메인 카메라 시점에서 스플랫을 그리고, 6개의 2D 섀도우 맵을 샘플링하여 그림자를 적용한다.
 
-## 5. 핵심 고려 사항 및 잠재적 개선점
+## 5. 구현된 주요 기능 및 개선 사항
 
+### 해결된 핵심 문제들:
+- **View/Projection Matrix 좌표계 문제**: GPU 규칙을 따르는 올바른 행렬 계산으로 해결
+- **6방향 그림자 맵 생성**: 큐브맵의 모든 면에서 올바른 뷰 렌더링 확인
+- **전역 셰이더 변수 최적화**: 효율적인 파라미터 전달 시스템 구현
+- **그림자 계산 단순화**: `SamplePointShadow` 함수를 통한 통합 그림자 계산
+
+### 구현된 기능들:
 - **노이즈 스플랫 필터링**:
-    - `ShadowCasterSplat.shader`의 프래그먼트 셰이더에서 `input.splatOpacity`나 `alpha_shape`에 대한 임계값을 강화하여, 불필요한 노이즈 스플랫이 그림자를 생성하지 않도록 조절할 수 있다.
-    - 또는, `CSCalcSharedLightData` 커널에서 원본 에셋의 불투명도나 스케일이 매우 작은 스플랫은 `opacity`를 0으로 만들어 섀도우 패스에서 자동으로 `discard` 되도록 할 수 있다.
-    - 하지만 이것은 궁극적인 해결책이 아니다. 이상적으로는 노이즈가 없는 가우시안 스플랫 모델이 있어야 한다.
-- **깊이 값 정밀도 및 선형화**:
-    - 광원의 `lightNearPlane`과 `lightFarPlane` 설정은 섀도우 맵의 깊이 정밀도에 큰 영향을 미친다. 씬의 스케일에 맞게 적절히 조절해야 한다.
-    - "RenderGaussianSplats.shader" 셰이더에서 `LinearizeDeviceDepthToViewZ` 함수를 사용하여 섀도우 맵의 비선형 하드웨어 뎁스 값을 선형 뷰 공간 깊이로 변환하여, 현재 프래그먼트의 선형 깊이와 올바르게 비교하는 것이 중요하다.
-- **`SampleShadowMapFromFaces` 함수의 UV 계산 정확성**:
-    - 이 함수 내의 UV 계산 로직은 `GaussianSplatShadowRenderer.cs`의 `GetLightViewMatrixForFace`에서 각 큐브맵 면을 렌더링할 때 사용한 뷰 행렬의 방향 및 업 벡터 설정과 정확히 일치해야 한다. 불일치 시 잘못된 면이나 UV에서 샘플링하여 그림자가 깨질 수 있다.
-- **성능**:
-    - 6개의 개별 2D 텍스처를 샘플링하는 것은 단일 `TextureCube`를 샘플링하는 것보다 셰이더 내 로직이 복잡해지고, 텍스처 페치(fetch)에 약간의 오버헤드가 있을 수 있다. 하지만 `SetRenderTarget`의 큐브맵 면 지정 기능에 문제가 있었으므로 이는 안정적인 대안이다.
-    - `FindActiveShadowCaster` 메서드는 현재 매 프레임 `FindObjectsByType`을 호출하므로, 씬에 많은 `GaussianSplatRenderer`가 있다면 성능에 영향을 줄 수 있다. 중앙 시스템에서 활성 캐스터 목록을 관리하는 방식으로 최적화할 수 있다.
+    - `shadowAlphaCutoff` 파라미터를 통한 조절 가능한 알파 컷오프 (기본값: 0.2)
+    - `ShadowCasterSplat.shader`에서 불필요한 노이즈 스플랫 자동 제거
+- **정확한 깊이 처리**:
+    - 광원의 `lightNearPlane`과 `lightFarPlane` 설정으로 섀도우 맵의 깊이 정밀도 조절
+    - VP 행렬을 직접 사용하여 깊이 선형화 과정 제거, 성능 향상
+- **올바른 좌표계 및 UV 계산**:
+    - `SamplePointShadow` 함수가 `GetLightViewMatrixForFace`의 UNITY_MATRIX_V 호환 구조와 완벽히 일치
+    - Unity 큐브맵 렌더링 표준 좌표계 기준 준수
+- **성능 최적화**:
+    - 전역 셰이더 변수를 통한 효율적인 파라미터 전달
+    - 6개의 View-Projection 행렬을 미리 계산하여 전역 변수로 설정 (`_ShadowMapFaceMatrixPX` 등)
+    - GPU 최적화된 행렬 계산 순서 적용
+    - 복잡한 UV 계산 로직 단순화
+
+### 추가 개선 가능 사항:
+- **성능 최적화**:
+    - `FindActiveShadowCaster` 메서드의 매 프레임 호출을 중앙 시스템 관리로 최적화 가능
+    - 큐브맵 면별 컬링을 통한 불필요한 렌더링 제거 가능
+- **품질 향상**:
+    - 그림자 맵 해상도를 동적으로 조절하는 LOD 시스템 추가 가능
+    - 소프트 섀도우 구현을 위한 PCF(Percentage-Closer Filtering) 적용 가능
