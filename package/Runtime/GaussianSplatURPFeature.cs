@@ -65,20 +65,15 @@ namespace GaussianSplatting.Runtime
             private static readonly ProfilingSampler s_ProfilingSamplerShadow = new(k_ProfilerTagShadow);
 
             private static readonly int s_GaussianSplatRT_ID = Shader.PropertyToID(k_GaussianSplatRTName);
-
-            // GaussianSplatShadowRenderer에 정의된 6개 면 텍스처 ID 배열을 참조 (정적 멤버로 접근)
-             private static readonly int[] s_ShadowMapFaceTextureGlobalIDs_Feature = new int[6] {
-                 Shader.PropertyToID("_ShadowMapFacePX"), Shader.PropertyToID("_ShadowMapFaceNX"),
-                 Shader.PropertyToID("_ShadowMapFacePY"), Shader.PropertyToID("_ShadowMapFaceNY"),
-                 Shader.PropertyToID("_ShadowMapFacePZ"), Shader.PropertyToID("_ShadowMapFaceNZ")
-             };
+            
+             private static readonly int s_ShadowCubemap_ID = Shader.PropertyToID("_ShadowCubemap");
 
 
             // 렌더 패스에 데이터를 전달하기 위한 구조체
             private class ShadowPassData
             {
                 internal GaussianSplatShadowRenderer shadowRenderer;
-                internal TextureHandle[] shadowFaceHandles = new TextureHandle[6]; // 6개의 2D 텍스처 핸들
+                internal TextureHandle shadowCubemapHandle;
             }
 
             private class MainPassData
@@ -102,14 +97,14 @@ namespace GaussianSplatting.Runtime
                     using (var builder = renderGraph.AddUnsafePass<ShadowPassData>(k_ProfilerTagShadow, out var passData))
                     {
                         passData.shadowRenderer = activeShadowCaster;
-                        RenderTextureDescriptor faceDesc = activeShadowCaster.GetShadowFaceDescriptor(); // 2D 뎁스용 디스크립터
-
-                        for(int i=0; i<6; ++i)
-                        {
-                            // 각 면에 대한 TextureHandle 생성
-                            passData.shadowFaceHandles[i] = UniversalRenderer.CreateRenderGraphTexture(renderGraph, faceDesc, $"_ShadowFaceRT_{i}", true);
-                            builder.UseTexture(passData.shadowFaceHandles[i], AccessFlags.Write);
-                        }
+                
+                        // [수정] Cubemap을 위한 디스크립터 설정
+                        RenderTextureDescriptor faceDesc = activeShadowCaster.GetShadowFaceDescriptor();
+                        faceDesc.dimension = TextureDimension.Cube; // 차원을 큐브맵으로 설정
+                        
+                        passData.shadowCubemapHandle = UniversalRenderer.CreateRenderGraphTexture(renderGraph, faceDesc, "_ShadowCubemap", true);
+                        
+                        builder.UseTexture(passData.shadowCubemapHandle, AccessFlags.Write);
                         builder.AllowPassCulling(false); // 섀도우 캐스터가 있으면 항상 실행 (IsRenderNeeded로 이미 판단)
 
                         // GaussianSplatURPFeature.cs - GSRenderPass - RecordRenderGraph - Shadow Pass - SetRenderFunc 내부
@@ -120,12 +115,9 @@ namespace GaussianSplatting.Runtime
                             using (new ProfilingScope(cmd, s_ProfilingSamplerShadow))
                             {
                                 // ShadowRenderer에 6개의 2D TextureHandle을 전달하여 렌더링 명령 기록
-                                data.shadowRenderer.RenderShadowFacesURP(cmd, data.shadowFaceHandles);
+                                data.shadowRenderer.RenderShadowFacesURP(cmd, data.shadowCubemapHandle);
                                 
-                                for(int i=0; i<6; ++i)
-                                {
-                                    cmd.SetGlobalTexture(s_ShadowMapFaceTextureGlobalIDs_Feature[i], data.shadowFaceHandles[i]);
-                                }
+                                cmd.SetGlobalTexture(s_ShadowCubemap_ID, data.shadowCubemapHandle);
                                 
                                 data.shadowRenderer.SetGlobalShadowParameters();
                             }

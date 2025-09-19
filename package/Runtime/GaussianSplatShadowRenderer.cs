@@ -76,6 +76,7 @@ namespace GaussianSplatting.Runtime
             Shader.PropertyToID("_ShadowMapFaceMatrixPY"), Shader.PropertyToID("_ShadowMapFaceMatrixNY"),
             Shader.PropertyToID("_ShadowMapFaceMatrixPZ"), Shader.PropertyToID("_ShadowMapFaceMatrixNZ")
         };
+        
         // 주 스플랫 셰이더에 전달할 광원 파라미터 ID
         private static readonly int s_PointLightPositionID_Main = Shader.PropertyToID("_PointLightPosition");
         private static readonly int s_ShadowBiasID_Main = Shader.PropertyToID("_ShadowBias");
@@ -224,14 +225,8 @@ namespace GaussianSplatting.Runtime
         }
 
         // URP Feature가 호출: 6개의 2D TextureHandle에 렌더링 명령 기록
-        public void RenderShadowFacesURP(CommandBuffer cmd, TextureHandle[] faceTextureHandles)
+        public void RenderShadowFacesURP(CommandBuffer cmd, TextureHandle shadowCubemapHandle)
         {
-            if (faceTextureHandles == null || faceTextureHandles.Length != 6)
-            {
-                Debug.LogError("RenderShadowFacesURP: 6개의 TextureHandle이 필요합니다.", this);
-                return;
-            }
-
             EnsureGpuResourcesForCompute(); 
             if (m_LightViewDataBuffer == null || !m_LightViewDataBuffer.IsValid() || m_SharedLightDataBuffer == null || !m_SharedLightDataBuffer.IsValid())
             {
@@ -271,7 +266,6 @@ namespace GaussianSplatting.Runtime
                 cmd.BeginSample(s_ProfDrawFaceMarkers[i]);
                 CubemapFace face = (CubemapFace)i;
                 Matrix4x4 currentLightViewMatrix = GetLightViewMatrixForFace(face);
-                // Matrix4x4 currentLightViewMatrix = pointLightTransform.worldToLocalMatrix;
 
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightViewMatrixID, currentLightViewMatrix);
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightModelViewMatrixID, currentLightViewMatrix * m_GaussianSplatRenderer.transform.localToWorldMatrix);
@@ -282,7 +276,7 @@ namespace GaussianSplatting.Runtime
                 int threadGroups = (m_GaussianSplatRenderer.ActiveSplatCount + (int)gsX - 1) / (int)gsX;
                 cmd.DispatchCompute(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, threadGroups, 1, 1);
 
-                cmd.SetRenderTarget(faceTextureHandles[i]); // URP가 제공한 i번째 2D TextureHandle
+                cmd.SetRenderTarget(shadowCubemapHandle, 0, face);
                 cmd.ClearRenderTarget(true, false, Color.clear, 1.0f); // 뎁스만 1.0으로 클리어
 
                 MaterialPropertyBlock mpb = new MaterialPropertyBlock();
@@ -393,20 +387,6 @@ namespace GaussianSplatting.Runtime
             
             Shader.SetGlobalFloat(s_LightBrightnessID_Main, lightBrightness);
             Shader.SetGlobalFloat(s_ShadowBrightnessID_Main, shadowBrightness);
-            
-            // 2. 6방향 View-Projection 행렬 계산 및 전역 변수 설정
-            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
-            lightProjectionMatrix = GL.GetGPUProjectionMatrix(lightProjectionMatrix, true);
-
-            for (int i = 0; i < 6; ++i)
-            {
-                CubemapFace face = (CubemapFace)i;
-                Matrix4x4 lightViewMatrix = GetLightViewMatrixForFace(face);
-                Matrix4x4 vpMatrix = lightProjectionMatrix * lightViewMatrix;
-
-                // 전역 행렬 변수로 설정
-                Shader.SetGlobalMatrix(s_ShadowMapFaceMatrixIDs[i], vpMatrix);
-            }
         }
         
         private bool HasSettingsChanged()
