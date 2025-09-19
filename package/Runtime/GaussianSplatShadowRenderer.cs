@@ -184,7 +184,7 @@ namespace GaussianSplatting.Runtime
             {
                 graphicsFormat = GraphicsFormat.None, // 컬러 버퍼 없음
                 depthStencilFormat = GraphicsFormat.D32_SFloat, // 32비트 부동소수점 뎁스
-                dimension = TextureDimension.Tex2D,
+                dimension = TextureDimension.Cube,
                 autoGenerateMips = false,
                 useMipMap = false,
                 msaaSamples = 1,

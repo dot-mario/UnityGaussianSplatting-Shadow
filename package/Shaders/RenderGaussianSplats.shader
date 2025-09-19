@@ -34,8 +34,8 @@ StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 
-UNITY_DECLARE_TEXCUBE(_ShadowCubemap);
-SAMPLER(sampler_GSShadowCubemap);
+TEXTURECUBE(_ShadowCubemap);
+SAMPLER(sampler_ShadowCubemap);
 
 float3 _PointLightPosition;    // 광원의 월드 좌표
 float _ShadowBias;             // 그림자 바이어스
@@ -51,15 +51,13 @@ float LinearToNonLinearDepth(float linearDepth, float near, float far)
 }
 
 // --- 점광원 그림자 계산 함수 ---
-// --- 점광원 그림자 계산 함수 (수정된 버전) ---
 bool SamplePointShadow(float3 worldPos)
 {
     // 1. 현재 픽셀의 '선형' 깊이(실제 거리)를 계산
     float3 lightVec = worldPos - _PointLightPosition;
     float currentLinearDepth = length(lightVec);
 
-    // 2. 큐브맵에서 가장 가까운 '비선형' 뎁스 값을 샘플링
-    float shadowMapNonLinearDepth = UNITY_SAMPLE_TEXCUBE(_ShadowCubemap, lightVec).r;
+    float shadowMapNonLinearDepth = SAMPLE_TEXTURECUBE(_ShadowCubemap, sampler_ShadowCubemap, lightVec).r;
 
     // 3. 큐브맵의 '비선형' 뎁스 값을 '선형' 깊이(실제 거리)로 변환
     //    LinearEyeDepth는 뷰 공간 기준이므로, 여기서는 0-1 선형 값으로 변환 후 Far Plane을 곱함
