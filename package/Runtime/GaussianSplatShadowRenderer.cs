@@ -41,6 +41,8 @@ namespace GaussianSplatting.Runtime
         public bool forceCubemapRenderForDebug = false;
 
         private RenderTexture[] m_ShadowFaceRTs = new RenderTexture[6]; // 6개의 2D RT (비URP 경로에서 주로 사용)
+        private RenderTexture m_ShadowCubemapRT; // URP 경로에서 재사용할 큐브맵 RT
+        private bool m_ShadowCubemapValid;
         private Material m_ShadowCasterMaterial;
         private GaussianSplatRenderer m_GaussianSplatRenderer;
         private bool m_shadowsDirty = true;
@@ -185,7 +187,7 @@ namespace GaussianSplatting.Runtime
             {
                 graphicsFormat = GraphicsFormat.None, // 컬러 버퍼 없음
                 depthStencilFormat = GraphicsFormat.D32_SFloat, // 32비트 부동소수점 뎁스
-                dimension = TextureDimension.Cube,
+                dimension = TextureDimension.Tex2D,
                 autoGenerateMips = false,
                 useMipMap = false,
                 msaaSamples = 1,
@@ -226,8 +228,14 @@ namespace GaussianSplatting.Runtime
         }
 
         // URP Feature가 호출: 6개의 2D TextureHandle에 렌더링 명령 기록
-        public void RenderShadowFacesURP(CommandBuffer cmd, TextureHandle shadowCubemapHandle)
+        public void RenderShadowFacesURP(CommandBuffer cmd, RenderTexture shadowCubemap)
         {
+            if (shadowCubemap == null)
+            {
+                Debug.LogError("RenderShadowFacesURP: 큐브맵 RenderTexture가 준비되지 않았습니다.", this);
+                return;
+            }
+            
             EnsureGpuResourcesForCompute(); 
             if (m_LightViewDataBuffer == null || !m_LightViewDataBuffer.IsValid() || m_SharedLightDataBuffer == null || !m_SharedLightDataBuffer.IsValid())
             {
@@ -283,7 +291,7 @@ namespace GaussianSplatting.Runtime
                 int threadGroups = (m_GaussianSplatRenderer.ActiveSplatCount + (int)gsX - 1) / (int)gsX;
                 cmd.DispatchCompute(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, threadGroups, 1, 1);
 
-                cmd.SetRenderTarget(shadowCubemapHandle, 0, face);
+                cmd.SetRenderTarget(shadowCubemap, 0, face);
                 cmd.ClearRenderTarget(true, false, Color.clear, 1.0f); // 뎁스만 1.0으로 클리어
 
                 MaterialPropertyBlock mpb = new MaterialPropertyBlock();
@@ -313,6 +321,7 @@ namespace GaussianSplatting.Runtime
             {
                 m_shadowsDirty = false;
             }
+            m_ShadowCubemapValid = true;
             UpdatePreviousSettings();
         }
         
@@ -378,6 +387,7 @@ namespace GaussianSplatting.Runtime
             {
                 m_shadowsDirty = false;
             }
+            m_ShadowCubemapValid = true;
             UpdatePreviousSettings();
         }
         
@@ -620,6 +630,7 @@ namespace GaussianSplatting.Runtime
         private void CleanupResources()
         {
             CleanupFaceRTs();
+            CleanupShadowCubemap();
             CleanupLightViewBuffer();
             CleanupSharedLightBuffer();
 
@@ -630,6 +641,50 @@ namespace GaussianSplatting.Runtime
                 m_ShadowCasterMaterial = null;
             }
         }
+        
+        private void CleanupShadowCubemap()
+        {
+            if (m_ShadowCubemapRT != null)
+            {
+                if (m_ShadowCubemapRT.IsCreated())
+                {
+                    m_ShadowCubemapRT.Release();
+                }
+                if (Application.isPlaying) Destroy(m_ShadowCubemapRT);
+                else DestroyImmediate(m_ShadowCubemapRT);
+                m_ShadowCubemapRT = null;
+            }
+            m_ShadowCubemapValid = false;
+        }
+        internal RenderTexture GetOrCreateShadowCubemap()
+        {
+            var desc = GetShadowFaceDescriptor();
+            desc.dimension = TextureDimension.Cube;
+            bool needsRecreate = m_ShadowCubemapRT == null ||
+                                 !m_ShadowCubemapRT.IsCreated() ||
+                                 m_ShadowCubemapRT.width != desc.width ||
+                                 m_ShadowCubemapRT.height != desc.height ||
+                                 m_ShadowCubemapRT.graphicsFormat != desc.graphicsFormat ||
+                                 m_ShadowCubemapRT.depthStencilFormat != desc.depthStencilFormat;
+            if (needsRecreate)
+            {
+                CleanupShadowCubemap();
+                m_ShadowCubemapRT = new RenderTexture(desc)
+                {
+                    name = $"ShadowCubemap_{gameObject.GetInstanceID()}",
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                if (!m_ShadowCubemapRT.Create())
+                {
+                    Debug.LogError($"[{nameof(GaussianSplatShadowRenderer)}] 큐브맵 RenderTexture 생성에 실패했습니다.", this);
+                    CleanupShadowCubemap();
+                    return null;
+                }
+                m_ShadowCubemapValid = false;
+            }
+            return m_ShadowCubemapRT;
+        }
+        internal bool HasValidShadowCubemap => m_ShadowCubemapValid && m_ShadowCubemapRT != null && m_ShadowCubemapRT.IsCreated();
 
         private void CleanupFaceRTs()
         {
