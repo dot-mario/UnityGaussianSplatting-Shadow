@@ -41,31 +41,28 @@ float3 _PointLightPosition;    // 광원의 월드 좌표
 float _ShadowBias;             // 그림자 바이어스
 float _LightFarPlaneGS;        // 광원 시점의 Far Plane 거리
 float _LightNearPlaneGS;       // 광원 시점의 Near Plane 거리
+float4 _LightZBufferParams;
 
 float _LightBrightness;        // 빛을 받는 영역의 밝기
 float _ShadowBrightness;       // 그림자 영역의 밝기
 
-float LinearToNonLinearDepth(float linearDepth, float near, float far)
-{
-    return (far * (linearDepth - near)) / (linearDepth * (far - near));
-}
-
 // --- 점광원 그림자 계산 함수 ---
 bool SamplePointShadow(float3 worldPos)
 {
-    // 1. 현재 픽셀의 '선형' 깊이(실제 거리)를 계산
+    // 현재 픽셀 위치에서 광원까지의 벡터
     float3 lightVec = worldPos - _PointLightPosition;
-    float currentLinearDepth = length(lightVec);
+
+    // Cube shadow map은 각 면의 카메라 전방 축을 기준으로 깊이를 저장한다.
+    // 따라서 벡터의 각 성분 중 절대값이 가장 큰 축이 실제로 사용된 면이며,
+    // 해당 축 방향 성분이 뎁스 버퍼에 기록된 선형 깊이값과 대응된다.
+    float3 absLightVec = abs(lightVec);
+    float currentLinearDepth = max(absLightVec.x, max(absLightVec.y, absLightVec.z));
 
     float shadowMapNonLinearDepth = SAMPLE_TEXTURECUBE(_ShadowCubemap, sampler_ShadowCubemap, lightVec).r;
+    float shadowMapLinear01Depth = LinearEyeDepth(shadowMapNonLinearDepth, _LightZBufferParams);
 
-    // 3. 큐브맵의 '비선형' 뎁스 값을 '선형' 깊이(실제 거리)로 변환
-    //    LinearEyeDepth는 뷰 공간 기준이므로, 여기서는 0-1 선형 값으로 변환 후 Far Plane을 곱함
-    float shadowMapLinearDepth = LinearEyeDepth(shadowMapNonLinearDepth, _ZBufferParams) * _LightFarPlaneGS;
-
-    // 4. '선형' 깊이끼리 비교하여 최종 그림자 판단
-    //    현재 픽셀의 거리가 그림자 맵에 저장된 거리보다 멀리 있으면 그림자.
-    bool visibility = currentLinearDepth <= shadowMapLinearDepth + _ShadowBias;
+    // 현재 축 기반 깊이가 저장된 깊이(+바이어스)보다 멀면 그림자 판정
+    bool visibility = currentLinearDepth <= shadowMapLinear01Depth + _ShadowBias;
     return visibility;
 }
 

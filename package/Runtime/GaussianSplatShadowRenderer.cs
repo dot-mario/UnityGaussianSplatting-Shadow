@@ -83,6 +83,8 @@ namespace GaussianSplatting.Runtime
         private static readonly int s_LightFarPlaneID_Main = Shader.PropertyToID("_LightFarPlaneGS");
         private static readonly int s_LightNearPlaneID_Main = Shader.PropertyToID("_LightNearPlaneGS");
         
+        private static readonly int s_LightZBufferParamsID_Main = Shader.PropertyToID("_LightZBufferParams");
+        
         private static readonly int s_LightBrightnessID_Main = Shader.PropertyToID("_LightBrightness");
         private static readonly int s_ShadowBrightnessID_Main = Shader.PropertyToID("_ShadowBrightness");
 
@@ -387,6 +389,31 @@ namespace GaussianSplatting.Runtime
             
             Shader.SetGlobalFloat(s_LightBrightnessID_Main, lightBrightness);
             Shader.SetGlobalFloat(s_ShadowBrightnessID_Main, shadowBrightness);
+            
+            // 2. _LightZBufferParams 계산 및 설정
+            Vector4 zBufferParams;
+            float near = lightNearPlane;
+            float far = lightFarPlane;
+            float f_div_n = far / near;
+
+            // 현재 프로젝트의 Z 버퍼 설정(Reversed or Normal)에 맞게 파라미터를 계산합니다.
+            // 이 처리는 셰이더의 Linear01DepthFromNear 함수와 쌍을 이룹니다.
+            if (SystemInfo.usesReversedZBuffer) // Reversed Z Buffer (modern platforms)
+            {
+                zBufferParams.x = -1.0f + f_div_n;
+                zBufferParams.y = 1.0f;
+                zBufferParams.z = zBufferParams.x / far;
+                zBufferParams.w = zBufferParams.y / far;
+            }
+            else // Normal Z Buffer
+            {
+                zBufferParams.x = 1.0f - f_div_n;
+                zBufferParams.y = f_div_n;
+                zBufferParams.z = zBufferParams.x / far;
+                zBufferParams.w = zBufferParams.y / far;
+            }
+
+            Shader.SetGlobalVector(s_LightZBufferParamsID_Main, zBufferParams);
         }
         
         private bool HasSettingsChanged()
