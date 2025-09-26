@@ -49,8 +49,8 @@ namespace GaussianSplatting.Runtime
             {
                 var cameraData = frameData.Get<UniversalCameraData>();
                 var resourceData = frameData.Get<UniversalResourceData>();
-                var activeShadowRenderer = FindActiveShadowCaster();
                 
+                var activeShadowRenderer = FindActiveShadowCaster();
                 if (activeShadowRenderer != null)
                 {
                     using var shadowBuilder = renderGraph.AddUnsafePass(ShadowProfilerTag, out ShadowPassData shadowPassData);

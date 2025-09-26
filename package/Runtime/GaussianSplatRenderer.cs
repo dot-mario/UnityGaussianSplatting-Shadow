@@ -113,6 +113,8 @@ namespace GaussianSplatting.Runtime
                 var gs = kvp.Item1;
                 gs.EnsureMaterials();
                 matComposite = gs.m_MatComposite;
+                if (matComposite != null)
+                    matComposite.SetFloat(GaussianSplatRenderer.Props.CompositeOpacity, gs.m_CompositeOpacity);
                 var mpb = kvp.Item2;
 
                 // sort
@@ -231,6 +233,9 @@ namespace GaussianSplatting.Runtime
         [Range(0.05f, 20.0f)]
         [Tooltip("Additional scaling factor for opacity")]
         public float m_OpacityScale = 1.0f;
+        [Range(0.0f, 5.0f)]
+        [Tooltip("Global opacity remap applied during composite. 1 keeps original accumulation, lower values make the splat stack more transparent.")]
+        public float m_CompositeOpacity = 1.0f;
         [Range(0, 3)] [Tooltip("Spherical Harmonics order to use")]
         public int m_SHOrder = 3;
         [Tooltip("Show only Spherical Harmonics contribution, using gray color")]
@@ -308,6 +313,7 @@ namespace GaussianSplatting.Runtime
             public static readonly int SHOnly = Shader.PropertyToID("_SHOnly");
             public static readonly int DisplayIndex = Shader.PropertyToID("_DisplayIndex");
             public static readonly int DisplayChunks = Shader.PropertyToID("_DisplayChunks");
+            public static readonly int CompositeOpacity = Shader.PropertyToID("_CompositeOpacity");
             public static readonly int GaussianSplatRT = Shader.PropertyToID("_GaussianSplatRT");
             public static readonly int SplatSortKeys = Shader.PropertyToID("_SplatSortKeys");
             public static readonly int SplatSortDistances = Shader.PropertyToID("_SplatSortDistances");
@@ -463,6 +469,7 @@ namespace GaussianSplatting.Runtime
             {
                 m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
                 m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
+                m_MatComposite.SetFloat(Props.CompositeOpacity, m_CompositeOpacity);
                 m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
                 m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
             }

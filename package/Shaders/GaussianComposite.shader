@@ -31,11 +31,19 @@ v2f vert (uint vtxID : SV_VertexID)
 }
 
 Texture2D _GaussianSplatRT;
+float _CompositeOpacity;
 
 half4 frag (v2f i) : SV_Target
 {
     half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
-    return float4(GammaToLinearSpace(col.rgb/col.a),col.a);
+    float opacity = saturate(col.a);
+    float invAlpha = opacity > 1e-5 ? rcp(opacity) : 0.0;
+    float3 baseColor = opacity > 1e-5 ? GammaToLinearSpace(float3(col.rgb) * invAlpha) : float3(0.0, 0.0, 0.0);
+
+    float compositeOpacity = max(_CompositeOpacity, 0.0);
+    float remappedOpacity = compositeOpacity > 0.0 ? 1.0 - pow(saturate(1.0 - opacity), compositeOpacity) : 0.0;
+
+    return float4(baseColor, remappedOpacity);
 }
 ENDCG
         }
