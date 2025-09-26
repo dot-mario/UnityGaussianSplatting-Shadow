@@ -136,7 +136,7 @@ struct SplatSHData
     half3 col, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, sh9, sh10, sh11, sh12, sh13, sh14, sh15;
 };
 
-half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH, half4 globalTintColor, half exposure)
+half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH)
 {
     dir *= -1;
 
@@ -175,11 +175,6 @@ half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH, half4 glob
             }
         }
     }
-    
-    // 모디파이어에 의한 색상 조절 적용
-    res.rgb *= globalTintColor.rgb;
-    res.rgb *= exposure;
-    
     return max(res, 0);
 }
 

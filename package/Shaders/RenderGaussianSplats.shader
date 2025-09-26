@@ -18,6 +18,7 @@ CGPROGRAM
 #pragma use_dxc
 
 #include "GaussianSplatting.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl" 
 
 StructuredBuffer<uint> _OrderBuffer;
 
@@ -33,19 +34,14 @@ StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 
-float4x4 _ShadowMapFaceMatrixPX, _ShadowMapFaceMatrixNX, _ShadowMapFaceMatrixPY, _ShadowMapFaceMatrixNY, _ShadowMapFaceMatrixPZ, _ShadowMapFaceMatrixNZ;
-
-Texture2D _ShadowMapFacePX; SamplerState sampler_ShadowMapFacePX; // +X
-Texture2D _ShadowMapFaceNX; SamplerState sampler_ShadowMapFaceNX; // -X
-Texture2D _ShadowMapFacePY; SamplerState sampler_ShadowMapFacePY; // +Y
-Texture2D _ShadowMapFaceNY; SamplerState sampler_ShadowMapFaceNY; // -Y
-Texture2D _ShadowMapFacePZ; SamplerState sampler_ShadowMapFacePZ; // +Z
-Texture2D _ShadowMapFaceNZ; SamplerState sampler_ShadowMapFaceNZ; // -Z
+TEXTURECUBE(_ShadowCubemap);
+SAMPLER(sampler_ShadowCubemap);
 
 float3 _PointLightPosition;    // 광원의 월드 좌표
 float _ShadowBias;             // 그림자 바이어스
 float _LightFarPlaneGS;        // 광원 시점의 Far Plane 거리
 float _LightNearPlaneGS;       // 광원 시점의 Near Plane 거리
+float4 _LightZBufferParams;
 
 float _LightBrightness;        // 빛을 받는 영역의 밝기
 float _ShadowBrightness;       // 그림자 영역의 밝기
@@ -53,67 +49,21 @@ float _ShadowBrightness;       // 그림자 영역의 밝기
 // --- 점광원 그림자 계산 함수 ---
 bool SamplePointShadow(float3 worldPos)
 {
-    // --- 1. 광원 벡터 계산 및 변수 초기화 ---
+    // 현재 픽셀 위치에서 광원까지의 벡터
     float3 lightVec = worldPos - _PointLightPosition;
-    float3 absVec = abs(lightVec);
-    float4 shadowCoord; // 결과를 담을 변수
 
-    // --- 2. 픽셀 위치에 따라 올바른 VP 행렬을 선택하여 광원 시점의 클립 좌표 계산 ---
-    if (absVec.x > absVec.y && absVec.x > absVec.z) // X face
-    {
-        if (lightVec.x > 0)
-            shadowCoord = mul(_ShadowMapFaceMatrixPX, float4(worldPos, 1.0));
-        else
-            shadowCoord = mul(_ShadowMapFaceMatrixNX, float4(worldPos, 1.0));
-    }
-    else if (absVec.y > absVec.z) // Y face
-    {
-        if (lightVec.y > 0)
-            shadowCoord = mul(_ShadowMapFaceMatrixPY, float4(worldPos, 1.0));
-        else
-            shadowCoord = mul(_ShadowMapFaceMatrixNY, float4(worldPos, 1.0));
-    }
-    else // Z face
-    {
-        if (lightVec.z > 0)
-            shadowCoord = mul(_ShadowMapFaceMatrixPZ, float4(worldPos, 1.0));
-        else
-            shadowCoord = mul(_ShadowMapFaceMatrixNZ, float4(worldPos, 1.0));
-    }
+    // Cube shadow map은 각 면의 카메라 전방 축을 기준으로 깊이를 저장한다.
+    // 따라서 벡터의 각 성분 중 절대값이 가장 큰 축이 실제로 사용된 면이며,
+    // 해당 축 방향 성분이 뎁스 버퍼에 기록된 선형 깊이값과 대응된다.
+    float3 absLightVec = abs(lightVec);
+    float currentLinearDepth = max(absLightVec.x, max(absLightVec.y, absLightVec.z));
 
-    // --- 3. NDC 좌표 및 UV 계산 (모든 페이스에 공통) ---
-    shadowCoord.xyz /= shadowCoord.w;                 // 동차 나누기 -> NDC (-1 ~ 1 범위)
-    float currentDepth = shadowCoord.z;               // 현재 픽셀의 깊이 (D3D에서 0 ~ 1 범위)
-    float2 shadowUV = shadowCoord.xy * 0.5 + 0.5;     // UV 좌표 (0 ~ 1 범위)
-    shadowUV.y = 1.0 - shadowUV.y;                    // D3D 환경을 위한 Y 좌표 반전
+    float shadowMapNonLinearDepth = SAMPLE_TEXTURECUBE(_ShadowCubemap, sampler_ShadowCubemap, lightVec).r;
+    float shadowMapLinear01Depth = LinearEyeDepth(shadowMapNonLinearDepth, _LightZBufferParams);
 
-    // --- 4. 뎁스맵에서 깊이 값 샘플링 ---
-    float shadowMapDepth = 1.0;
-    if (absVec.x > absVec.y && absVec.x > absVec.z) // X face
-    {
-        if (lightVec.x > 0)
-            shadowMapDepth = _ShadowMapFacePX.Sample(sampler_ShadowMapFacePX, shadowUV).r;
-        else
-            shadowMapDepth = _ShadowMapFaceNX.Sample(sampler_ShadowMapFaceNX, shadowUV).r;
-    }
-    else if (absVec.y > absVec.z) // Y face
-    {
-        if (lightVec.y > 0)
-            shadowMapDepth = _ShadowMapFacePY.Sample(sampler_ShadowMapFacePY, shadowUV).r;
-        else
-            shadowMapDepth = _ShadowMapFaceNY.Sample(sampler_ShadowMapFaceNY, shadowUV).r;
-    }
-    else // Z face
-    {
-        if (lightVec.z > 0)
-            shadowMapDepth = _ShadowMapFacePZ.Sample(sampler_ShadowMapFacePZ, shadowUV).r;
-        else
-            shadowMapDepth = _ShadowMapFaceNZ.Sample(sampler_ShadowMapFaceNZ, shadowUV).r;
-    }
-
-    // --- 5. 깊이 비교 및 최종 그림자 판단 ---
-    bool visibility = (currentDepth >= shadowMapDepth - _ShadowBias);
-	return visibility;
+    // 현재 축 기반 깊이가 저장된 깊이(+바이어스)보다 멀면 그림자 판정
+    bool visibility = currentLinearDepth <= shadowMapLinear01Depth + _ShadowBias;
+    return visibility;
 }
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)

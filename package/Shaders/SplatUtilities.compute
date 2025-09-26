@@ -16,7 +16,6 @@
 #pragma kernel CSScaleSelection
 #pragma kernel CSExportData
 #pragma kernel CSCopySplats
-#pragma kernel CSAngleBasedColorChange
 #pragma kernel CSCalcSharedLightData
 #pragma kernel CSCalcLightViewData
 
@@ -50,10 +49,6 @@ int _SelectionMode;
 RWStructuredBuffer<uint> _SplatSortDistances;
 RWStructuredBuffer<uint> _SplatSortKeys;
 uint _SplatCount;
-
-float4 _GlobalTintColor;
-float _Exposure;
-
 // radix sort etc. friendly, see http://stereopsis.com/radix.html
 uint FloatToSortableUint(float f)
 {
@@ -252,7 +247,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         objViewDir = normalize(objViewDir);
 
         half4 col;
-        col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0, _GlobalTintColor, _Exposure);
+        col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
         col.a = min(splat.opacity * opacityScale, 65000);
         view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
@@ -765,100 +760,6 @@ void CSCopySplats (uint3 id : SV_DispatchThreadID)
         _CopyDstEditDeleted.InterlockedOr(dstWordIdx * 4, 1u << dstBitIdx);
     }
 }
-
-// AngleBasedColorModifier에서 설정한 유니폼들
-float3 _OriginWorldPos;
-float3 _OriginWorldForward;
-float _ViewAngleCos; // (FOV/2)의 코사인 값 (즉, 중심으로부터 FOV/2 각도에 해당하는 코사인 값)
-float4 _TargetColor;
-float _MaxDistanceSq;
-int _ColorApplyMode; // 0: Replace, 1: Multiply, 2: Add
-
-// GpuColorTexture를 쓰기 가능한 RWTexture2D로 바인딩
-RWTexture2D<float4> _SplatColorRW;
-
-
-// 필요한 다른 버퍼/유니폼 선언은 GaussianSplatting.hlsl 및 기존 커널에서 가져옴
-// 예: _SplatPos, _MatrixObjectToWorld, _SplatFormat, _SplatCount, _SplatChunkCount, _SplatChunks, kChunkSize
-// GaussianSplatting.hlsl의 LoadSplatPosValue, SplatIndexToPixelIndex 등 함수 사용
-
-#define APPLY_MODE_REPLACE 0
-#define APPLY_MODE_MULTIPLY 1
-#define APPLY_MODE_ADD 2
-
-[numthreads(GROUP_SIZE,1,1)]
-void CSAngleBasedColorChange (uint3 id : SV_DispatchThreadID)
-{
-    uint idx = id.x;
-    if (idx >= _SplatCount)
-        return;
-
-    // Splat의 월드 좌표 가져오기 (GaussianSplatting.hlsl의 LoadSplatPos와 동일 로직)
-    float3 splatLocalPos = LoadSplatPosValue(idx);
-    uint chunkIdx = idx / kChunkSize;
-    if (chunkIdx < _SplatChunkCount)
-    {
-        SplatChunkInfo chunk = _SplatChunks[chunkIdx];
-        float3 posMin = float3(chunk.posX.x, chunk.posY.x, chunk.posZ.x);
-        float3 posMax = float3(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
-        splatLocalPos = lerp(posMin, posMax, splatLocalPos);
-    }
-    float3 splatWorldPos = mul(_MatrixObjectToWorld, float4(splatLocalPos, 1)).xyz;
-
-    // 1. 거리 체크
-    float3 vecToSplat = splatWorldPos - _OriginWorldPos;
-    float distSq = dot(vecToSplat, vecToSplat);
-    if (distSq > _MaxDistanceSq)
-    {
-        return; // 거리 제한 초과
-    }
-
-    // 2. 방향 및 각도 체크
-    //    vecToSplat이 0벡터가 되는 경우 (splatWorldPos == _OriginWorldPos)에 대한 예외처리 필요할 수 있음
-    if (distSq < 0.00001f) // 매우 가까운 경우 (사실상 같은 위치)는 각도 계산 의미 없음 -> 항상 포함 또는 항상 제외 규칙 필요
-    {
-         // 여기서는 일단 포함하는 것으로 처리 (또는 다른 규칙 적용 가능)
-    }
-    else
-    {
-        float3 dirToSplatNormalized = normalize(vecToSplat);
-        float dotProduct = dot(dirToSplatNormalized, _OriginWorldForward);
-
-        if (dotProduct < _ViewAngleCos) // _ViewAngleCos는 (FOV/2)의 코사인. dotProduct가 이보다 작으면 각도 벗어남.
-        {
-            return; // 시야각 벗어남
-        }
-    }
-    
-
-    // 조건 만족: 색상 변경
-    uint3 pixelCoord = SplatIndexToPixelIndex(idx);
-    float4 currentColor = _SplatColorRW[pixelCoord.xy]; // 현재 색상 읽기 (쓰기 가능한 텍스처에서)
-
-    float4 finalColor = currentColor;
-
-    if (_ColorApplyMode == APPLY_MODE_REPLACE)
-    {
-        finalColor.rgb = _TargetColor.rgb;
-        // 알파 값 처리: _TargetColor.a를 사용하거나, 기존 알파 유지 또는 다른 로직
-        finalColor.a = _TargetColor.a; // 예: 타겟 색상의 알파 사용
-    }
-    else if (_ColorApplyMode == APPLY_MODE_MULTIPLY)
-    {
-        finalColor.rgb *= _TargetColor.rgb;
-        finalColor.a *= _TargetColor.a; // 알파도 곱하기 (선택적)
-    }
-    else if (_ColorApplyMode == APPLY_MODE_ADD)
-    {
-        finalColor.rgb += _TargetColor.rgb;
-        finalColor.a += _TargetColor.a; // 알파도 더하기 (선택적, saturate 필요할 수 있음)
-    }
-    
-    _SplatColorRW[pixelCoord.xy] = saturate(finalColor); // 최종 색상 쓰기 (알파 포함)
-}
-
-//===============
-
 
 RWStructuredBuffer<SharedLightData> _SharedLightDataOutput;
 StructuredBuffer<SharedLightData> _SharedLightDataInput;

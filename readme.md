@@ -1,4 +1,4 @@
-_Read this in other languages: [English](./readme.ko.md)
+_Read this in other languages: [Korean](./readme.ko.md)
 ***
 # Unity Gaussian Splatting Shadow Rendering
 
@@ -6,7 +6,7 @@ This document describes a rendering system that implements dynamic point light s
 
 ## TL;DR
 
-The implementation of dynamic point light shadows for the Gaussian Splatting model in the Unity URP environment is complete. The system renders depth maps from the point light's position in six directions, stores them in six individual 2D textures, and then samples these textures in the main rendering pass to apply shadows.
+The implementation of dynamic point light shadows for the Gaussian Splatting model in the Unity URP environment is complete. The system renders depth from the point light's position into a single cube `RenderTexture` (six faces) and then samples that cubemap during the main rendering pass to apply shadows.
 
 ### Core Pipeline:
 
@@ -15,7 +15,7 @@ The implementation of dynamic point light shadows for the Gaussian Splatting mod
       * It receives the correct, GPU-compliant `_LightViewMatrix` and `_LightProjMatrix` from C# for the current face.
       * Using the `SharedLightData` buffer as input, it calculates the splat's final clip-space position and its on-screen shape (2D ellipse axes), storing the results in the `LightViewData` buffer.
 3.  **ShadowCasterSplat.shader (Vertex/Fragment Shader)**:
-      * Reads the `LightViewData` buffer and renders each splat into the depth texture using `DrawProcedural` to record the depth values.
+      * Reads the `LightViewData` buffer and renders each splat into the currently bound cubemap face (depth + color disabled) using `DrawProcedural`, recording depth for that face.
 
 ### Core Problem Solved:
 
@@ -59,7 +59,7 @@ graph TD
         S1_Control["C#: Control & Dispatch"]
         S1_CS1(Compute: CSCalcSharedLightData)
         S1_Data1[(SharedLightData Buffer)]
-        S1_Result[/6x 2D Depth Textures/]
+        S1_Result[/Shadow Cubemap (6 faces)/]
 
         %% Flow: Control -> Enters Loop
         S1_Control -- Dispatch --> S1_CS1
@@ -82,7 +82,7 @@ graph TD
         
         %% Outer Loop Data Flow
         S1_Data1 -- "reads" --> S1_CS2
-        S1_HLSL -- "writes to face[i]" --> S1_Result
+        S1_HLSL -- "writes to cubemap face[i]" --> S1_Result
     end
 
     %% ==========================================
@@ -109,21 +109,21 @@ graph TD
 
 ## 1. Overview
 
-This document outlines the rendering pipeline for implementing dynamic point light shadows for Gaussian Splatting models in a Unity 6 URP environment. The core objective is to generate depth maps from the light's perspective in six directions to form cubemap-like shadow information. This information is then used during the main splat rendering pass to determine if each splat is in shadow.
+This document outlines the rendering pipeline for implementing dynamic point light shadows for Gaussian Splatting models in a Unity 6 URP environment. The core objective is to generate depth from the light's perspective in six directions and store the results in a single shadow cubemap. This cubemap is then sampled during the main splat rendering pass to determine whether each splat is lit or shadowed.
 
-Because issues arose when rendering directly to each face of a cubemap, a workaround was adopted: **depth information for each face is recorded in six separate 2D render textures**. The main rendering shader then references these six textures to calculate shadows.
+Earlier versions relied on six individual 2D render textures as a workaround. The pipeline now renders directly into a GPU cubemap (`RenderTextureDimension.Cube`), eliminating the extra bookkeeping while keeping the per-face compute shader workflow intact.
 
 
 **Key Components:**
 
   - **`GaussianSplatRenderer.cs`**: The main component responsible for rendering individual Gaussian Splat assets.
-  - **`GaussianSplatShadowRenderer.cs`**: A component attached to a specific `GaussianSplatRenderer` that is dedicated to generating shadow maps for a point light. It manages the six 2D depth textures and creates rendering commands.
+  - **`GaussianSplatShadowRenderer.cs`**: A component attached to a specific `GaussianSplatRenderer` that is dedicated to generating shadow maps for a point light. It manages the shared shadow cubemap and records rendering commands.
   - **`GaussianSplatURPFeature.cs`**: A URP `ScriptableRendererFeature` that inserts and manages the shadow map generation pass and the main splat rendering pass within the Render Graph.
   - **`SplatUtilities.compute` (Compute Shader)**: Handles GPU-based processing of splat data.
       - `CSCalcSharedLightData`: Prepares light-independent splat data (e.g., position, 3D covariance, original opacity).
       - `CSCalcLightViewData`: Takes the output from `CSCalcSharedLightData` to calculate view-specific splat data (e.g., clip-space position, 2D ellipse axes) from a particular light's perspective.
-  - **`ShadowCasterSplat.shader` (HLSL Shader)**: Used in the shadow map generation pass to render each splat into a 2D depth texture, recording its depth value.
-  - **`RenderGaussianSplats.shader` (HLSL Shader)**: Used in the main splat rendering pass. It samples the six 2D shadow map textures to apply shadows to the final splat color.
+  - **`ShadowCasterSplat.shader` (HLSL Shader)**: Used in the shadow map generation pass to render each splat into the cubemap's depth faces.
+  - **`RenderGaussianSplats.shader` (HLSL Shader)**: Used in the main splat rendering pass. It samples the shadow cubemap to apply shadows to the final splat color.
   - **`GaussianSplatting.hlsl` (HLSL Include)**: Contains common structs (e.g., `SplatData`, `SplatViewData`, `SharedLightData`, `LightViewData`) and utility functions.
 
 -----
@@ -134,28 +134,27 @@ The goal of this phase is to render the scene from the point light's position in
 
 ### 2.1. Role of `GaussianSplatShadowRenderer.cs`
 
-  - **Manages 6 2D Depth Render Textures**:
-      - `RenderTexture[] m_ShadowFaceRTs`: An array of six 2D `RenderTexture`s for use in non-URP paths. They are created and managed in `EnsureResourcesAreCreated()` with the appropriate resolution (`shadowCubemapResolution`) and depth format (e.g., `GraphicsFormat.D32_SFloat`).
-      - `GetShadowFaceDescriptor()`: Provides the `RenderTextureDescriptor` needed by the URP Feature to create six 2D depth texture handles in the Render Graph. This descriptor is set with `dimension = TextureDimension.Tex2D`.
+  - **Manages the Shadow Cubemap**:
+      - `RenderTexture m_ShadowCubemapRT`: A reusable cube `RenderTexture` that stores the six depth faces. `GetOrCreateShadowCubemap()` allocates (or reuses) the resource with the requested resolution and depth format.
+      - `HasValidShadowCubemap`: Tracks whether the cubemap currently contains up-to-date shadow data so unnecessary renders can be skipped.
   - **Prepares Compute Shaders and Rendering**:
       - `EnsureGpuResourcesForCompute()`: Prepares necessary GPU buffers for the compute shaders, such as `m_LightViewDataBuffer` and `m_SharedLightDataBuffer`.
       - `EnsureShadowCasterMaterial()`: Prepares the material (`m_ShadowCasterMaterial`) that uses the `shadowCasterShader`.
-  - **Improved View/Projection Matrix Calculation**:
+  - **Accurate View/Projection Matrix Calculation**:
       - **GPU-Compatible Projection Matrix**: Converted using `GL.GetGPUProjectionMatrix()` in the correct order to adhere to GPU conventions.
-      - **Accurate View Matrix**: Directly calculated in `GetLightViewMatrixForFace()` with a structure identical to `UNITY_MATRIX_V`.
-      - **Global Shader Variables**: Sets all shadow-related parameters as global variables via `SetGlobalShadowParameters()`.
+      - **View Matrices Per Face**: Directly calculated in `GetLightViewMatrixForFace()` with a structure identical to `UNITY_MATRIX_V` for each cubemap face.
+      - **Global Shader Variables**: Sets light position, bias, near/far planes, brightness controls, and `ZBufferParams` via `SetGlobalShadowParameters()`.
   - **URP Integration Method**:
-      - `RenderShadowFacesURP(CommandBuffer cmd, TextureHandle[] faceTextureHandles)`: Receives a `CommandBuffer` and an array of six 2D `TextureHandle`s from the URP Feature.
-        1.  `DispatchSharedDataKernel(cmd)`: Dispatches the `CSCalcSharedLightData` kernel to pre-calculate light-common data for all splats and stores it in `m_SharedLightDataBuffer`.
-        2.  Loop (iterates 6 times, for each cubemap face):
+      - `RenderShadowFacesURP(CommandBuffer cmd, RenderTexture shadowCubemap)`: Receives a `CommandBuffer` and the shared cubemap.
+        1.  `DispatchSharedDataKernel(cmd)`: Dispatches the `CSCalcSharedLightData` kernel once to pre-calculate light-common data for all splats and stores it in `m_SharedLightDataBuffer`.
+        2.  Loop (iterates 6 times, once per cubemap face):
               - `GetLightViewMatrixForFace((CubemapFace)i)`: Calculates the light's view matrix for the current face, **following correct GPU conventions**.
-              - **GPU-Compatible Projection Matrix**: Applies `GL.GetGPUProjectionMatrix(Matrix4x4.Perspective(...), true)`.
-              - Sets compute shader parameters: `_LightViewMatrix`, `_LightModelViewMatrix`, `_LightProjMatrix`, `_LightScreenParams`, etc., for the `CSCalcLightViewData` kernel.
-              - Dispatches the `CSCalcLightViewData` kernel: Using `m_SharedLightDataBuffer` as input, it calculates `LightViewData` for the current face and stores it in `m_LightViewDataBuffer`.
-              - `cmd.SetRenderTarget(faceTextureHandles[i])`: Sets the i-th 2D `TextureHandle` provided by the URP Feature as the render target.
-              - `cmd.ClearRenderTarget(true, false, Color.black, 1.0f)`: Clears only the depth buffer to 1.0 (far value).
-              - Adds `shadowAlphaCutoff` to the necessary buffer (`_LightSplatViewDataOutput`) and uniform settings for `m_ShadowCasterMaterial`.
-              - `cmd.DrawProcedural(...)`: Renders the splats to the current render target (the i-th 2D depth texture) using `ShadowCasterSplat.shader`.
+              - Applies the GPU-compatible projection matrix (`GL.GetGPUProjectionMatrix(Matrix4x4.Perspective(...), true)`).
+              - Updates compute shader parameters (`_LightViewMatrix`, `_LightModelViewMatrix`, `_LightProjMatrix`, `_LightScreenParams`, etc.) and dispatches `CSCalcLightViewData` to populate `m_LightViewDataBuffer` for that face.
+              - `cmd.SetRenderTarget(shadowCubemap, 0, face)`: Binds the correct face of the cubemap as the depth render target.
+              - `cmd.ClearRenderTarget(true, false, Color.clear, 1.0f)`: Clears only the depth buffer of the current face.
+              - Configures a `MaterialPropertyBlock` (including `shadowAlphaCutoff`) and issues `cmd.DrawProcedural(...)` with `ShadowCasterSplat.shader` to write depth into the face.
+        3.  Marks the cubemap as valid unless debug overrides force a re-render.
   - **Other**: State management methods like `IsRenderNeeded()`, `MarkShadowsDirty()`, `HasSettingsChanged()`, and `UpdatePreviousSettings()`.
 
 ### 2.2. `SplatUtilities.compute` (Compute Shader)
@@ -176,7 +175,7 @@ The goal of this phase is to render the scene from the point light's position in
 
 ### 2.3. `ShadowCasterSplat.shader` (HLSL)
 
-  - **Role**: Renders each splat into a 2D depth texture from the light's perspective to record depth values.
+  - **Role**: Renders each splat into the active cubemap face from the light's perspective to record depth values.
   - **Vertex Shader (`vert_shadow_caster`)**:
       - Input: `_LightSplatViewDataOutput` buffer (`LightViewData` per splat).
       - Task:
@@ -194,7 +193,7 @@ The goal of this phase is to render the scene from the point light's position in
         3.  *(Optional)* `discard`s noisy splats using a threshold on `input.splatOpacity` or `alpha_shape`.
         4.  `final_alpha = saturate(alpha_shape * input.splatOpacity)`.
         5.  `if (final_alpha < THRESHOLD)` then `discard`. (THRESHOLD is `1.0/255.0` or an adjusted value).
-      - Due to `ZWrite On` and `ColorMask 0` settings, only the depth values of pixels that are not `discard`ed are written to the render target (the 2D depth texture).
+      - Due to `ZWrite On` and `ColorMask 0` settings, only the depth values of pixels that are not `discard`ed are written to the bound cubemap face.
 
 ### 2.4. `GaussianSplatURPFeature.cs` (Shadow Pass Section)
 
@@ -202,39 +201,35 @@ The goal of this phase is to render the scene from the point light's position in
   - **Shadow Pass Logic in `RecordRenderGraph` method**:
     1.  Finds the currently active `GaussianSplatShadowRenderer` instance via `FindActiveShadowCaster()`.
     2.  Checks if a shadow map update is needed by calling `activeShadowCaster.IsRenderNeeded()`.
-    3.  If needed, adds a Render Graph pass using `ShadowPassData`.
-    4.  Calls `activeShadowCaster.GetShadowFaceDescriptor()` to get the descriptor for the 2D depth textures.
-    5.  In a loop, creates six 2D `TextureHandle`s (`passData.shadowFaceHandles[i]`) using `renderGraph.CreateTexture` (or `UniversalRenderer.CreateRenderGraphTexture`) and sets write access with `builder.UseTexture`.
-    6.  Defines `builder.SetRenderFunc`:
-          - Gets a `CommandBuffer`.
-          - Calls `activeShadowCaster.RenderShadowFacesURP(cmd, passData.shadowFaceHandles)` to record the commands for rendering shadows into the six 2D texture handles.
-          - In a loop, sets each of the six rendered 2D texture handles (`passData.shadowFaceHandles[i]`) as a global shader variable with a unique name (`s_ShadowMapFaceTextureGlobalIDs_Feature[i]`) using `cmd.SetGlobalTexture`.
-          - Calls `activeShadowCaster.SetShadowParametersOnMainMaterial(...)` to set shadow-related parameters on the main splat material. This can be done by resolving `RTHandle`s to actual `Texture`s or by relying on the global textures and having this function only set non-texture uniforms.
+    3.  Adds a Render Graph pass that:
+          - Retrieves (or allocates) the shared cubemap through `activeShadowCaster.GetOrCreateShadowCubemap()`.
+          - If rendering is required, invokes `activeShadowCaster.RenderShadowFacesURP(cmd, cubemap)` to refresh the data.
+          - Aborts early if the cubemap could not be created or remains invalid.
+          - Sets the cubemap as a global texture (`_ShadowCubemap`) and pushes shadow-related uniforms via `activeShadowCaster.SetGlobalShadowParameters()` so subsequent passes can sample it.
 
 -----
 
 ## 3. Main Splat Rendering & Shadow Application Phase
 
-In this phase, the six 2D depth textures generated in the previous step are used to apply shadows to each splat pixel during the main rendering pass.
+In this phase, the cubemap generated in the previous step is sampled to apply shadows to each splat pixel during the main rendering pass.
 
 ### 3.1. `RenderGaussianSplats.shader` (HLSL)
 
   - **Role**: Renders Gaussian splats from the main camera's perspective and incorporates the calculated shadow information into the final color.
   - **Uniform Declarations**:
-      - Declares six `Texture2D`s (e.g., `_ShadowMapFacePX`) and their corresponding `SamplerState`s (e.g., `sampler_ShadowMapFacePX`) to receive the six 2D shadow map faces.
-      - Receives uniforms for light information (`_PointLightPosition`), shadow bias (`_ShadowBias`), and the light's near/far planes (`_LightNearPlaneGS`, `_LightFarPlaneGS`).
+      - Declares a single `TEXTURECUBE(_ShadowCubemap)` with its sampler to access the six faces.
+      - Receives uniforms for light information (`_PointLightPosition`), shadow bias (`_ShadowBias`), the light's near/far planes (`_LightNearPlaneGS`, `_LightFarPlaneGS`), `_LightZBufferParams`, and brightness controls (`_LightBrightness`, `_ShadowBrightness`).
   - **Vertex Shader (`vert`)**:
       - Reads the splat's world-space center position (`view.worldPos_center`) from `SplatViewData` and passes it to the fragment shader (`o.worldPos`).
       - Calculates the splat's on-screen position (`o.clipPos`) and local coordinates for Gaussian shape calculation (`o.localGaussianPos`) as per the existing logic.
   - **Fragment Shader (`frag`)**:
     1.  Calculates the splat's base color (`calculatedColor`), shape alpha (`shapeAlpha`), and final alpha (`finalAlpha`) according to the existing logic, and performs selection and `discard` logic.
     2.  **Shadow Calculation**:
-          - `half shadow = SamplePointShadow(i.worldPos)`: Calls a new, unified function to calculate the point light shadow value.
-          - This function uses the light's six View-Projection matrices (e.g., `_ShadowMapFaceMatrixPX`) directly for accurate shadow calculation.
-          - It selects the correct VP matrix based on the pixel position, performs NDC transformation and UV calculation, and then performs a depth comparison on the corresponding shadow map.
+          - `half visibility = SamplePointShadow(i.worldPos)`: Samples the shadow cubemap and compares depth against the current fragment.
+          - The helper picks the dominant axis of `lightVec`, samples the cubemap with that direction, linearizes the stored depth via `_LightZBufferParams`, and applies `_ShadowBias` before producing a 0–1 visibility value.
     3.  **Final Color Application**:
-          - `half3 finalColor = i.col.rgb * shadow`: Multiplies the calculated shadow coefficient with the splat color.
-          - `return half4(finalColor * alpha, alpha)`: Outputs the final color and alpha in a non-premultiplied format (to match the `Blend OneMinusDstAlpha One` blend mode).
+          - `half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility)` scales between lit and shadow brightness.
+          - `return half4(i.col.rgb * lightIntensity * alpha, alpha)` outputs the final contribution using the existing blend mode.
 
 ### 3.2. `SamplePointShadow` Function (in `RenderGaussianSplats.shader`)
 
@@ -243,23 +238,22 @@ In this phase, the six 2D depth textures generated in the previous step are used
   - **Input**: `float3 worldPos` (world-space position of the current fragment).
   - **Task**:
     1.  **Calculate Light Vector**: `lightVec = worldPos - _PointLightPosition`.
-    2.  **Select Cubemap Face**: Chooses the appropriate X, Y, or Z face based on the largest component of `absVec = abs(lightVec)`.
-    3.  **Apply VP Matrix**: Uses the selected face's View-Projection matrix (e.g., `_ShadowMapFaceMatrixPX`) to calculate `shadowCoord = mul(vpMatrix, float4(worldPos, 1.0))`.
-    4.  **NDC Transformation**: Performs perspective divide `shadowCoord.xyz /= shadowCoord.w` to get NDC coordinates.
-    5.  **UV Calculation**: Converts NDC coordinates to the 0-1 UV range and applies a Y-coordinate flip for the D3D environment.
-    6.  **Depth Comparison**: Samples the depth value from the corresponding shadow map and compares it with the current pixel's depth to determine if it is in shadow.
-  - **Return Value**: `half shadow` (1.0 = lit, 0.2 = shadowed).
+    2.  **Compute Linear Depth**: Uses the dominant component of `abs(lightVec)` as the fragment's current linear depth relative to the light.
+    3.  **Sample Cubemap**: Fetches the stored depth (`shadowMapNonLinearDepth`) with `SAMPLE_TEXTURECUBE(_ShadowCubemap, sampler_ShadowCubemap, lightVec)`.
+    4.  **Linearize Depth**: Converts the stored value to linear space via `LinearEyeDepth(shadowMapNonLinearDepth, _LightZBufferParams)`.
+    5.  **Depth Comparison**: Compares `currentLinearDepth` against the sampled depth plus `_ShadowBias` to determine visibility.
+  - **Return Value**: `half visibility` (1.0 = lit, 0.0 = shadowed).
 
 **Key Improvements**:
 
-  - More accurate coordinate transformation by using the VP matrix directly.
-  - Simplified UV calculation logic.
-  - Improved performance by removing the depth linearization step.
+  - Eliminates manual UV reconstruction and per-face VP matrix selection in the fragment stage.
+  - Leverages the hardware cubemap sampler, reducing shader constants and texture bindings.
+  - Centralizes depth linearization through `_LightZBufferParams`, matching Unity's built-in handling of reversed or standard Z buffers.
 
 ### 3.3. `GaussianSplatURPFeature.cs` (Main Pass Section)
 
-  - Calls `GaussianSplatRenderSystem.instance.SortAndRenderSplats()`, which uses the six 2D shadow map textures set as global variables in the shadow pass, along with other shadow uniforms (`_PointLightPosition`, `_ShadowBias`, etc.) set on the main splat material via `SetShadowParametersOnMainMaterial`.
-  - The `SortAndRenderSplats` function renders the splats using the "Render Splats" shader, whose fragment shader executes the shadow calculation logic described above.
+  - Calls `GaussianSplatRenderSystem.instance.SortAndRenderSplats()`, which relies on the global shadow cubemap and uniforms (`_PointLightPosition`, `_ShadowBias`, `_LightBrightness`, `_ShadowBrightness`, `_LightZBufferParams`, etc.) populated during the shadow pass.
+  - The `SortAndRenderSplats` function renders the splats using the "Render Splats" shader, whose fragment shader samples `_ShadowCubemap` to apply the visibility calculated in `SamplePointShadow`.
 
 -----
 
@@ -267,18 +261,16 @@ In this phase, the six 2D depth textures generated in the previous step are used
 
 1.  **`GaussianSplatRenderer`**: Loads the original splat asset data (position, rotation, scale, color, SH coefficients, etc.) into GPU buffers.
 2.  **`GaussianSplatShadowRenderer`**:
-      - Manages light information (position, near/far planes, resolution).
-      - Provides the descriptor for creating 2D depth textures to the URP Feature.
-      - Receives six 2D `TextureHandle`s from the URP Feature and records shadow map generation commands into a `CommandBuffer`.
-          - Executes `CSCalcSharedLightData` -> Executes `CSCalcLightViewData` (for each face) -> `DrawProcedural` with `ShadowCasterSplat.shader` (for each face texture).
-      - Sets shadow-related uniforms (light position, bias, the six 2D shadow map textures, etc.) on the main splat material.
+      - Manages light information (position, near/far planes, resolution) and owns the reusable shadow cubemap.
+      - Records the compute + draw workload that populates each cubemap face (`CSCalcSharedLightData` → `CSCalcLightViewData` × 6 → `DrawProcedural` with `ShadowCasterSplat.shader`).
+      - Pushes global uniforms through `SetGlobalShadowParameters()` so other passes can read `_ShadowCubemap` and associated settings.
 3.  **`GaussianSplatURPFeature`**:
-      - **Shadow Pass**: Creates six 2D depth `TextureHandle`s, passes them to `GaussianSplatShadowRenderer` to command rendering, and then sets the six resulting textures as global shader variables.
-      - **Main Pass**: Triggers the main splat rendering via `GaussianSplatRenderSystem`. The "Render Splats" shader used in this pass utilizes the globally set shadow map textures and other uniforms to calculate shadows.
+      - **Shadow Pass**: Retrieves the active `GaussianSplatShadowRenderer`, ensures the cubemap exists, optionally re-renders it, and sets `_ShadowCubemap` plus related globals.
+      - **Main Pass**: Triggers the main splat rendering via `GaussianSplatRenderSystem`. The "Render Splats" shader samples the globally bound cubemap and applies the visibility values.
 4.  **Shaders**:
       - `SplatUtilities.compute`: Efficiently processes splat data on the GPU, transforming it into the required format for both the shadow and main passes.
-      - `ShadowCasterSplat.shader`: Draws splats from the light's perspective into 2D depth textures to record depth information.
-      - `RenderGaussianSplats.shader`: Draws splats from the main camera's perspective and samples the six 2D shadow maps to apply shadows.
+      - `ShadowCasterSplat.shader`: Draws splats from the light's perspective into the cubemap faces to record depth information.
+      - `RenderGaussianSplats.shader`: Draws splats from the main camera's perspective and samples `_ShadowCubemap` to blend lit/shadowed contributions.
 
 -----
 
@@ -287,9 +279,9 @@ In this phase, the six 2D depth textures generated in the previous step are used
 ### Key Problems Solved:
 
   - **View/Projection Matrix Coordinate System Issue**: Resolved by correctly calculating matrices that adhere to GPU conventions.
-  - **6-Directional Shadow Map Generation**: Verified correct view rendering for all cubemap faces.
-  - **Global Shader Variable Optimization**: Implemented an efficient parameter-passing system.
-  - **Simplified Shadow Calculation**: Unified shadow calculation logic within the `SamplePointShadow` function.
+  - **Shadow Cubemap Consolidation**: Replaced six standalone render textures with a single cube `RenderTexture` while keeping correct per-face rendering.
+  - **Global Shader Variable Optimization**: Implemented an efficient parameter-passing system, including `_ShadowCubemap`, `_LightZBufferParams`, and brightness controls.
+  - **Simplified Shadow Calculation**: Unified the sampling logic in `SamplePointShadow`, leveraging the hardware cubemap sampler.
 
 ### Implemented Features:
 
@@ -298,15 +290,16 @@ In this phase, the six 2D depth textures generated in the previous step are used
       - Automatic removal of unnecessary noisy splats in `ShadowCasterSplat.shader`.
   - **Accurate Depth Handling**:
       - Adjustable shadow map depth precision using the light's `lightNearPlane` and `lightFarPlane` settings.
-      - Improved performance by removing the depth linearization step through direct VP matrix usage.
-  - **Correct Coordinate System and UV Calculation**:
-      - The `SamplePointShadow` function is perfectly aligned with the `UNITY_MATRIX_V` compatible structure of `GetLightViewMatrixForFace`.
-      - Adherence to Unity's standard coordinate system for cubemap rendering.
+      - Consistent interpretation of stored depth through `_LightZBufferParams` and `LinearEyeDepth`, regardless of reversed or normal Z configuration.
+  - **Shadow Cubemap Integration**:
+      - `RenderShadowFacesURP` writes directly into a cube `RenderTexture`, keeping all six faces synchronized and avoiding per-face texture management.
+      - `SetGlobalShadowParameters()` exposes `_ShadowCubemap`, `_LightBrightness`, and `_ShadowBrightness` so any pass can query the lighting state.
+  - **Correct Coordinate System & Sampling**:
+      - `GetLightViewMatrixForFace()` still mirrors `UNITY_MATRIX_V`, ensuring the compute stage matches hardware cubemap conventions.
+      - `SamplePointShadow` relies on the cubemap sampler instead of manually reconstructing UVs, reducing shader branching.
   - **Performance Optimizations**:
-      - Efficient parameter passing via global shader variables.
-      - Pre-calculation of the six View-Projection matrices, set as global variables (e.g., `_ShadowMapFaceMatrixPX`).
-      - Application of a GPU-optimized matrix calculation order.
-      - Simplified complex UV calculation logic.
+      - Fewer texture bindings in the main pass (one cubemap instead of six 2D textures).
+      - The cubemap resource is reused across frames, minimizing allocations and command-buffer churn.
 
 ### Potential Future Improvements:
 

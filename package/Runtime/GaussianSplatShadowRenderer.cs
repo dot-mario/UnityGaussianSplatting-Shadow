@@ -5,7 +5,6 @@ using Unity.Profiling.LowLevel;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering; // Required for TextureHandle in some Unity versions
 using UnityEngine.Rendering;
-using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.Serialization; // Required for UniversalRenderPipelineAsset
 
@@ -40,7 +39,8 @@ namespace GaussianSplatting.Runtime
         [Tooltip("디버깅을 위해 매 프레임 큐브맵 렌더링을 강제합니다 (성능 저하 유발).")]
         public bool forceCubemapRenderForDebug = false;
 
-        private RenderTexture[] m_ShadowFaceRTs = new RenderTexture[6]; // 6개의 2D RT (비URP 경로에서 주로 사용)
+        private RenderTexture m_ShadowCubemapRT; // URP 경로에서 재사용할 큐브맵 RT
+        private bool m_ShadowCubemapValid;
         private Material m_ShadowCasterMaterial;
         private GaussianSplatRenderer m_GaussianSplatRenderer;
         private bool m_shadowsDirty = true;
@@ -65,22 +65,13 @@ namespace GaussianSplatting.Runtime
         
         private static readonly int s_ShadowAlphaCutoffID = Shader.PropertyToID("_ShadowAlphaCutoff");
 
-        // 주 스플랫 셰이더에 전달할 6개의 2D 섀도우 맵 텍스처 이름 ID
-        private static readonly int[] s_ShadowMapFaceTextureIDs = new int[6] {
-            Shader.PropertyToID("_ShadowMapFacePX"), Shader.PropertyToID("_ShadowMapFaceNX"),
-            Shader.PropertyToID("_ShadowMapFacePY"), Shader.PropertyToID("_ShadowMapFaceNY"),
-            Shader.PropertyToID("_ShadowMapFacePZ"), Shader.PropertyToID("_ShadowMapFaceNZ")
-        };
-        private static readonly int[] s_ShadowMapFaceMatrixIDs = new int[6] {
-            Shader.PropertyToID("_ShadowMapFaceMatrixPX"), Shader.PropertyToID("_ShadowMapFaceMatrixNX"),
-            Shader.PropertyToID("_ShadowMapFaceMatrixPY"), Shader.PropertyToID("_ShadowMapFaceMatrixNY"),
-            Shader.PropertyToID("_ShadowMapFaceMatrixPZ"), Shader.PropertyToID("_ShadowMapFaceMatrixNZ")
-        };
         // 주 스플랫 셰이더에 전달할 광원 파라미터 ID
         private static readonly int s_PointLightPositionID_Main = Shader.PropertyToID("_PointLightPosition");
         private static readonly int s_ShadowBiasID_Main = Shader.PropertyToID("_ShadowBias");
         private static readonly int s_LightFarPlaneID_Main = Shader.PropertyToID("_LightFarPlaneGS");
         private static readonly int s_LightNearPlaneID_Main = Shader.PropertyToID("_LightNearPlaneGS");
+        
+        private static readonly int s_LightZBufferParamsID_Main = Shader.PropertyToID("_LightZBufferParams");
         
         private static readonly int s_LightBrightnessID_Main = Shader.PropertyToID("_LightBrightness");
         private static readonly int s_ShadowBrightnessID_Main = Shader.PropertyToID("_ShadowBrightness");
@@ -88,8 +79,8 @@ namespace GaussianSplatting.Runtime
         private ComputeShader m_SplatUtilitiesCS;
         private GraphicsBuffer m_LightViewDataBuffer;
         private GraphicsBuffer m_SharedLightDataBuffer;
-        private int m_CSCalcLightViewDataKernel = -1;
-        private int m_CSCalcSharedLightDataKernel = -1;
+        private const int k_CSCalcLightViewDataKernel = (int)GaussianSplatRenderer.KernelIndices.CalcLightViewData;
+        private const int k_CSCalcSharedLightDataKernel = (int)GaussianSplatRenderer.KernelIndices.CalcSharedLightData;
 
         // 프로파일러 마커
         internal static readonly ProfilerMarker s_ProfCalcSharedData = new ProfilerMarker(ProfilerCategory.Render, "GaussianShadow.CalcSharedData", MarkerFlags.SampleGPU);
@@ -120,10 +111,9 @@ namespace GaussianSplatting.Runtime
                 return;
             }
             m_SplatUtilitiesCS = m_GaussianSplatRenderer.CSSplatUtilities;
-            m_CSCalcLightViewDataKernel = m_SplatUtilitiesCS.FindKernel("CSCalcLightViewData");
-            m_CSCalcSharedLightDataKernel = m_SplatUtilitiesCS.FindKernel("CSCalcSharedLightData");
-
-            if (m_CSCalcLightViewDataKernel == -1 || m_CSCalcSharedLightDataKernel == -1)
+            bool hasLightKernel = m_SplatUtilitiesCS.HasKernel("CSCalcLightViewData");
+            bool hasSharedKernel = m_SplatUtilitiesCS.HasKernel("CSCalcSharedLightData");
+            if (!hasLightKernel || !hasSharedKernel)
             {
                 Debug.LogError($"[{nameof(GaussianSplatShadowRenderer)}] '{m_SplatUtilitiesCS.name}'에서 필요한 컴퓨트 셰이더 커널을 찾을 수 없습니다. 이 컴포넌트를 비활성화합니다.", this);
                 enabled = false;
@@ -160,11 +150,6 @@ namespace GaussianSplatting.Runtime
             if (!m_GaussianSplatRenderer || !m_GaussianSplatRenderer.isActiveAndEnabled || !shadowCasterShader) return;
             if (!m_GaussianSplatRenderer.HasValidAsset || !m_GaussianSplatRenderer.HasValidRenderSetup) return;
 
-            if (IsRenderNeeded())
-            {
-                // RenderShadowFacesNonURP(); 
-            }
-            // 비URP 시에도 주 렌더러의 머티리얼에 텍스처와 파라미터 설정
             SetGlobalShadowParameters();
         }
         
@@ -193,8 +178,6 @@ namespace GaussianSplatting.Runtime
             return desc;
         }
         
-        
-
         void DispatchSharedDataKernel(CommandBuffer cmd)
 
         {
@@ -202,36 +185,36 @@ namespace GaussianSplatting.Runtime
             
             m_GaussianSplatRenderer.SetAssetDataOnCS(cmd, GaussianSplatRenderer.KernelIndices.CalcSharedLightData);
             
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatChunks, m_GaussianSplatRenderer.GpuChunksBuffer);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatOther, m_GaussianSplatRenderer.GpuOtherData);
-            cmd.SetComputeTextureParam(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatColor, m_GaussianSplatRenderer.GpuColorTexture);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatChunks, m_GaussianSplatRenderer.GpuChunksBuffer);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatOther, m_GaussianSplatRenderer.GpuOtherData);
+            cmd.SetComputeTextureParam(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, GaussianSplatRenderer.Props.SplatColor, m_GaussianSplatRenderer.GpuColorTexture);
             
             cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.MatrixObjectToWorld, m_GaussianSplatRenderer.transform.localToWorldMatrix);
             cmd.SetComputeFloatParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatScale, m_GaussianSplatRenderer.m_SplatScale);
             cmd.SetComputeFloatParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatOpacityScale, m_GaussianSplatRenderer.m_OpacityScale);
             cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatCount, m_GaussianSplatRenderer.splatCount);
             
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, s_SharedLightDataOutputID, m_SharedLightDataBuffer);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, s_SharedLightDataOutputID, m_SharedLightDataBuffer);
             cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatChunkCount, m_GaussianSplatRenderer.m_GpuChunksValid ? m_GaussianSplatRenderer.GpuChunksBuffer.count : 0);
 
-            m_SplatUtilitiesCS.GetKernelThreadGroupSizes(m_CSCalcSharedLightDataKernel, out uint gsX, out _, out _);
+            m_SplatUtilitiesCS.GetKernelThreadGroupSizes(k_CSCalcSharedLightDataKernel, out uint gsX, out _, out _);
             int threadGroups = (m_GaussianSplatRenderer.splatCount + (int)gsX - 1) / (int)gsX;
 
-            cmd.DispatchCompute(m_SplatUtilitiesCS, m_CSCalcSharedLightDataKernel, threadGroups, 1, 1);
+            cmd.DispatchCompute(m_SplatUtilitiesCS, k_CSCalcSharedLightDataKernel, threadGroups, 1, 1);
             
             cmd.EndSample(s_ProfCalcSharedData);
         }
 
         // URP Feature가 호출: 6개의 2D TextureHandle에 렌더링 명령 기록
-        public void RenderShadowFacesURP(CommandBuffer cmd, TextureHandle[] faceTextureHandles)
+        public void RenderShadowFacesURP(CommandBuffer cmd, RenderTexture shadowCubemap)
         {
-            if (faceTextureHandles == null || faceTextureHandles.Length != 6)
+            if (shadowCubemap == null)
             {
-                Debug.LogError("RenderShadowFacesURP: 6개의 TextureHandle이 필요합니다.", this);
+                Debug.LogError("RenderShadowFacesURP: 큐브맵 RenderTexture가 준비되지 않았습니다.", this);
                 return;
             }
-
+            
             EnsureGpuResourcesForCompute(); 
             if (m_LightViewDataBuffer == null || !m_LightViewDataBuffer.IsValid() || m_SharedLightDataBuffer == null || !m_SharedLightDataBuffer.IsValid())
             {
@@ -251,18 +234,24 @@ namespace GaussianSplatting.Runtime
             lightProjectionMatrix = GL.GetGPUProjectionMatrix(lightProjectionMatrix, true);
 
             // 루프 외부에서 설정 가능한 컴퓨트 셰이더 파라미터 (CSCalcLightViewDataKernel용)
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
-            cmd.SetComputeTextureParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatColor, m_GaussianSplatRenderer.GpuColorTexture); // GpuColorTexture 접근자 필요
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
+            cmd.SetComputeTextureParam(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatColor, m_GaussianSplatRenderer.GpuColorTexture); // GpuColorTexture 접근자 필요
             cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.MatrixObjectToWorld, m_GaussianSplatRenderer.transform.localToWorldMatrix);
             
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, s_SharedLightDataInputID, m_SharedLightDataBuffer);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, s_LightSplatViewDataOutputID, m_LightViewDataBuffer);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, s_SharedLightDataInputID, m_SharedLightDataBuffer);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, s_LightSplatViewDataOutputID, m_LightViewDataBuffer);
             
-            cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatBitsValid, (m_GaussianSplatRenderer.m_GpuEditSelected != null && m_GaussianSplatRenderer.m_GpuEditSelected.IsValid()) && (m_GaussianSplatRenderer.GpuEditDeleted != null && m_GaussianSplatRenderer.GpuEditDeleted.IsValid()) ? 1 : 0);
+            cmd.SetComputeIntParam(
+                m_SplatUtilitiesCS,
+                GaussianSplatRenderer.Props.SplatBitsValid,
+                (m_GaussianSplatRenderer.GpuEditSelected != null && m_GaussianSplatRenderer.GpuEditSelected.IsValid()) &&
+                (m_GaussianSplatRenderer.GpuEditDeleted != null && m_GaussianSplatRenderer.GpuEditDeleted.IsValid())
+                    ? 1
+                    : 0);
             uint format = (uint)m_GaussianSplatRenderer.asset.posFormat | ((uint)m_GaussianSplatRenderer.asset.scaleFormat << 8) | ((uint)m_GaussianSplatRenderer.asset.shFormat << 16);
             cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatFormat, (int)format);
             cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatCount, m_GaussianSplatRenderer.ActiveSplatCount);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatChunks, m_GaussianSplatRenderer.GpuChunksBuffer);
+            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatChunks, m_GaussianSplatRenderer.GpuChunksBuffer);
             cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatChunkCount, m_GaussianSplatRenderer.m_GpuChunksValid ? m_GaussianSplatRenderer.GpuChunksBuffer.count : 0);
 
 
@@ -271,18 +260,17 @@ namespace GaussianSplatting.Runtime
                 cmd.BeginSample(s_ProfDrawFaceMarkers[i]);
                 CubemapFace face = (CubemapFace)i;
                 Matrix4x4 currentLightViewMatrix = GetLightViewMatrixForFace(face);
-                // Matrix4x4 currentLightViewMatrix = pointLightTransform.worldToLocalMatrix;
 
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightViewMatrixID, currentLightViewMatrix);
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightModelViewMatrixID, currentLightViewMatrix * m_GaussianSplatRenderer.transform.localToWorldMatrix);
                 cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightProjMatrixID, lightProjectionMatrix);
                 cmd.SetComputeVectorParam(m_SplatUtilitiesCS, s_LightScreenParamsID_Shadow, new Vector4(shadowCubemapResolution, shadowCubemapResolution, 0, 0));
                 
-                m_SplatUtilitiesCS.GetKernelThreadGroupSizes(m_CSCalcLightViewDataKernel, out uint gsX, out _, out _);
+                m_SplatUtilitiesCS.GetKernelThreadGroupSizes(k_CSCalcLightViewDataKernel, out uint gsX, out _, out _);
                 int threadGroups = (m_GaussianSplatRenderer.ActiveSplatCount + (int)gsX - 1) / (int)gsX;
-                cmd.DispatchCompute(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, threadGroups, 1, 1);
+                cmd.DispatchCompute(m_SplatUtilitiesCS, k_CSCalcLightViewDataKernel, threadGroups, 1, 1);
 
-                cmd.SetRenderTarget(faceTextureHandles[i]); // URP가 제공한 i번째 2D TextureHandle
+                cmd.SetRenderTarget(shadowCubemap, 0, face);
                 cmd.ClearRenderTarget(true, false, Color.clear, 1.0f); // 뎁스만 1.0으로 클리어
 
                 MaterialPropertyBlock mpb = new MaterialPropertyBlock();
@@ -312,65 +300,7 @@ namespace GaussianSplatting.Runtime
             {
                 m_shadowsDirty = false;
             }
-            UpdatePreviousSettings();
-        }
-        
-        private void RenderShadowFacesNonURP() // NonURP는 아직 개발 완료 안됨
-        {
-            EnsureResourcesAreCreated(); 
-            EnsureGpuResourcesForCompute();
-            if (m_LightViewDataBuffer == null || !m_LightViewDataBuffer.IsValid() || m_SharedLightDataBuffer == null || !m_SharedLightDataBuffer.IsValid()) return;
-
-            var cmd = CommandBufferPool.Get($"RenderShadowFacesNonURP_{gameObject.name}");
-            
-            DispatchSharedDataKernel(cmd);
-
-            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
-            // (CSCalcLightViewDataKernel용 전역 파라미터 설정 - RenderShadowFacesURP와 동일하게)
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatPos, m_GaussianSplatRenderer.GpuPosData);
-            cmd.SetComputeTextureParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatColor, m_GaussianSplatRenderer.GpuColorTexture);
-            // cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.MatrixObjectToWorld, m_GaussianSplatRenderer.transform.localToWorldMatrix);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, s_SharedLightDataInputID, m_SharedLightDataBuffer);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, s_LightSplatViewDataOutputID, m_LightViewDataBuffer);
-            cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatBitsValid, (m_GaussianSplatRenderer.m_GpuEditSelected != null && m_GaussianSplatRenderer.m_GpuEditSelected.IsValid()) && (m_GaussianSplatRenderer.GpuEditDeleted != null && m_GaussianSplatRenderer.GpuEditDeleted.IsValid()) ? 1 : 0);
-            uint format = (uint)m_GaussianSplatRenderer.asset.posFormat | ((uint)m_GaussianSplatRenderer.asset.scaleFormat << 8) | ((uint)m_GaussianSplatRenderer.asset.shFormat << 16);
-            cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatFormat, (int)format);
-            cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatCount, m_GaussianSplatRenderer.ActiveSplatCount);
-            cmd.SetComputeBufferParam(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, GaussianSplatRenderer.Props.SplatChunks, m_GaussianSplatRenderer.GpuChunksBuffer);
-            cmd.SetComputeIntParam(m_SplatUtilitiesCS, GaussianSplatRenderer.Props.SplatChunkCount, m_GaussianSplatRenderer.m_GpuChunksValid ? m_GaussianSplatRenderer.GpuChunksBuffer.count : 0);
-
-            for (int i = 0; i < 6; ++i)
-            {
-                cmd.BeginSample(s_ProfDrawFaceMarkers[i]);
-                CubemapFace face = (CubemapFace)i;
-                Matrix4x4 currentLightViewMatrix = GetLightViewMatrixForFace(face);
-
-                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightViewMatrixID, currentLightViewMatrix);
-                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightModelViewMatrixID, currentLightViewMatrix * m_GaussianSplatRenderer.transform.localToWorldMatrix);
-                cmd.SetComputeMatrixParam(m_SplatUtilitiesCS, s_LightProjMatrixID, lightProjectionMatrix);
-                cmd.SetComputeVectorParam(m_SplatUtilitiesCS, s_LightScreenParamsID_Shadow, new Vector4(shadowCubemapResolution, shadowCubemapResolution, 0, 0));
-                
-                m_SplatUtilitiesCS.GetKernelThreadGroupSizes(m_CSCalcLightViewDataKernel, out uint gsX, out _, out _);
-                int threadGroups = (m_GaussianSplatRenderer.ActiveSplatCount + (int)gsX - 1) / (int)gsX;
-                cmd.DispatchCompute(m_SplatUtilitiesCS, m_CSCalcLightViewDataKernel, threadGroups, 1, 1);
-            
-                cmd.SetRenderTarget(m_ShadowFaceRTs[i]);
-                cmd.ClearRenderTarget(true, false, Color.clear, 1.0f);
-
-                m_ShadowCasterMaterial.SetVector(s_LightScreenParamsID_Shadow, new Vector4(shadowCubemapResolution, shadowCubemapResolution, 0, 0));
-                m_ShadowCasterMaterial.SetBuffer(s_LightSplatViewDataOutputID, m_LightViewDataBuffer);
-                cmd.DrawProcedural(
-                    m_GaussianSplatRenderer.m_GpuIndexBuffer, Matrix4x4.identity,
-                    m_ShadowCasterMaterial, 0, MeshTopology.Triangles, 6, m_GaussianSplatRenderer.ActiveSplatCount);
-                cmd.EndSample(s_ProfDrawFaceMarkers[i]);
-            }
-            Graphics.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-
-            if (!forceCubemapRenderForDebug)
-            {
-                m_shadowsDirty = false;
-            }
+            m_ShadowCubemapValid = true;
             UpdatePreviousSettings();
         }
         
@@ -394,19 +324,30 @@ namespace GaussianSplatting.Runtime
             Shader.SetGlobalFloat(s_LightBrightnessID_Main, lightBrightness);
             Shader.SetGlobalFloat(s_ShadowBrightnessID_Main, shadowBrightness);
             
-            // 2. 6방향 View-Projection 행렬 계산 및 전역 변수 설정
-            Matrix4x4 lightProjectionMatrix = Matrix4x4.Perspective(90f, 1.0f, lightNearPlane, lightFarPlane);
-            lightProjectionMatrix = GL.GetGPUProjectionMatrix(lightProjectionMatrix, true);
+            // 2. _LightZBufferParams 계산 및 설정
+            Vector4 zBufferParams;
+            float near = lightNearPlane;
+            float far = lightFarPlane;
+            float f_div_n = far / near;
 
-            for (int i = 0; i < 6; ++i)
+            // 현재 프로젝트의 Z 버퍼 설정(Reversed or Normal)에 맞게 파라미터를 계산합니다.
+            // 이 처리는 셰이더의 Linear01DepthFromNear 함수와 쌍을 이룹니다.
+            if (SystemInfo.usesReversedZBuffer) // Reversed Z Buffer (modern platforms)
             {
-                CubemapFace face = (CubemapFace)i;
-                Matrix4x4 lightViewMatrix = GetLightViewMatrixForFace(face);
-                Matrix4x4 vpMatrix = lightProjectionMatrix * lightViewMatrix;
-
-                // 전역 행렬 변수로 설정
-                Shader.SetGlobalMatrix(s_ShadowMapFaceMatrixIDs[i], vpMatrix);
+                zBufferParams.x = -1.0f + f_div_n;
+                zBufferParams.y = 1.0f;
+                zBufferParams.z = zBufferParams.x / far;
+                zBufferParams.w = zBufferParams.y / far;
             }
+            else // Normal Z Buffer
+            {
+                zBufferParams.x = 1.0f - f_div_n;
+                zBufferParams.y = f_div_n;
+                zBufferParams.z = zBufferParams.x / far;
+                zBufferParams.w = zBufferParams.y / far;
+            }
+
+            Shader.SetGlobalVector(s_LightZBufferParamsID_Main, zBufferParams);
         }
         
         private bool HasSettingsChanged()
@@ -497,44 +438,6 @@ namespace GaussianSplatting.Runtime
             }
         }
         
-        private void EnsureResourcesAreCreated() // 주로 비URP 경로에서 m_ShadowFaceRTs 생성/관리
-        {
-            EnsureShadowCasterMaterial();
-            
-            var faceDesc = GetShadowFaceDescriptor(); // 2D 뎁스 텍스처용 디스크립터
-            bool recreateAllRTs = false;
-
-            if (m_ShadowFaceRTs == null || m_ShadowFaceRTs.Length != 6) {
-                m_ShadowFaceRTs = new RenderTexture[6];
-                recreateAllRTs = true;
-            }
-
-            for (int i = 0; i < 6; i++)
-            {
-                if (recreateAllRTs || m_ShadowFaceRTs[i] == null || 
-                    m_ShadowFaceRTs[i].width != shadowCubemapResolution || 
-                    m_ShadowFaceRTs[i].height != shadowCubemapResolution || 
-                    !m_ShadowFaceRTs[i].IsCreated() ||
-                    m_ShadowFaceRTs[i].graphicsFormat != faceDesc.graphicsFormat || 
-                    m_ShadowFaceRTs[i].depthStencilFormat != faceDesc.depthStencilFormat)
-                {
-                    if (m_ShadowFaceRTs[i])
-                    {
-                        m_ShadowFaceRTs[i].Release();
-                        if (Application.isPlaying) Destroy(m_ShadowFaceRTs[i]);
-                        else DestroyImmediate(m_ShadowFaceRTs[i]);
-                    }
-                    m_ShadowFaceRTs[i] = new RenderTexture(faceDesc) { 
-                        name = $"ShadowFaceRT_{i}_{gameObject.GetInstanceID()}",
-                        hideFlags = HideFlags.HideAndDontSave
-                    };
-                    if(!m_ShadowFaceRTs[i].Create()) {
-                        Debug.LogError($"Failed to create ShadowFaceRT_{i}");
-                    }
-                }
-            }
-        }
-
         // UNITY_MATRIX_V 대체
         // Camera.worldToCameraMatrix는 카메라의 전방이 -Z축이 되는 OpenGL 표준 규칙을 따름
         // https://discussions.unity.com/t/unity-custom-camera-view-matrix-in-shader/533800/5
@@ -601,7 +504,7 @@ namespace GaussianSplatting.Runtime
 
         private void CleanupResources()
         {
-            CleanupFaceRTs();
+            CleanupShadowCubemap();
             CleanupLightViewBuffer();
             CleanupSharedLightBuffer();
 
@@ -612,24 +515,51 @@ namespace GaussianSplatting.Runtime
                 m_ShadowCasterMaterial = null;
             }
         }
-
-        private void CleanupFaceRTs()
-        {
-            if (m_ShadowFaceRTs != null)
-            {
-                for (int i = 0; i < 6; i++)
-                {
-                    if (m_ShadowFaceRTs[i] != null)
-                    {
-                        if (m_ShadowFaceRTs[i].IsCreated()) m_ShadowFaceRTs[i].Release();
-                        if (Application.isPlaying) Destroy(m_ShadowFaceRTs[i]);
-                        else DestroyImmediate(m_ShadowFaceRTs[i]);
-                        m_ShadowFaceRTs[i] = null;
-                    }
-                }
-            }
-        }
         
+        private void CleanupShadowCubemap()
+        {
+            if (m_ShadowCubemapRT != null)
+            {
+                if (m_ShadowCubemapRT.IsCreated())
+                {
+                    m_ShadowCubemapRT.Release();
+                }
+                if (Application.isPlaying) Destroy(m_ShadowCubemapRT);
+                else DestroyImmediate(m_ShadowCubemapRT);
+                m_ShadowCubemapRT = null;
+            }
+            m_ShadowCubemapValid = false;
+        }
+        internal RenderTexture GetOrCreateShadowCubemap()
+        {
+            var desc = GetShadowFaceDescriptor();
+            desc.dimension = TextureDimension.Cube;
+            bool needsRecreate = m_ShadowCubemapRT == null ||
+                                 !m_ShadowCubemapRT.IsCreated() ||
+                                 m_ShadowCubemapRT.width != desc.width ||
+                                 m_ShadowCubemapRT.height != desc.height ||
+                                 m_ShadowCubemapRT.graphicsFormat != desc.graphicsFormat ||
+                                 m_ShadowCubemapRT.depthStencilFormat != desc.depthStencilFormat;
+            if (needsRecreate)
+            {
+                CleanupShadowCubemap();
+                m_ShadowCubemapRT = new RenderTexture(desc)
+                {
+                    name = $"ShadowCubemap_{gameObject.GetInstanceID()}",
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                if (!m_ShadowCubemapRT.Create())
+                {
+                    Debug.LogError($"[{nameof(GaussianSplatShadowRenderer)}] 큐브맵 RenderTexture 생성에 실패했습니다.", this);
+                    CleanupShadowCubemap();
+                    return null;
+                }
+                m_ShadowCubemapValid = false;
+            }
+            return m_ShadowCubemapRT;
+        }
+        internal bool HasValidShadowCubemap => m_ShadowCubemapValid && m_ShadowCubemapRT != null && m_ShadowCubemapRT.IsCreated();
+
         private void CleanupLightViewBuffer()
         {
             m_LightViewDataBuffer?.Dispose();
