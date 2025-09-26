@@ -53,7 +53,7 @@ graph TD
         S1_Control["C#: 제어 및 디스패치"]
         S1_CS1(Compute: CSCalcSharedLightData)
         S1_Data1[(SharedLightData Buffer)]
-        S1_Result[/Shadow Cubemap (6 faces)/]
+        S1_Result[/Shadow Cubemap/]
 
         %% 흐름 정의: 제어 -> 루프 진입
         S1_Control -- Dispatch --> S1_CS1

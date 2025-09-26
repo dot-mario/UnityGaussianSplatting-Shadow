@@ -59,7 +59,7 @@ graph TD
         S1_Control["C#: Control & Dispatch"]
         S1_CS1(Compute: CSCalcSharedLightData)
         S1_Data1[(SharedLightData Buffer)]
-        S1_Result[/Shadow Cubemap (6 faces)/]
+        S1_Result[/Shadow Cubemap/]
 
         %% Flow: Control -> Enters Loop
         S1_Control -- Dispatch --> S1_CS1
