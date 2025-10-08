@@ -21,6 +21,7 @@ CGPROGRAM
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl" 
 
 StructuredBuffer<uint> _OrderBuffer;
+float4 _GlobalTint;
 
 struct v2f
 {
@@ -137,20 +138,22 @@ half4 frag (v2f i) : SV_Target
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
 	
-    if (alpha < 1.0/255.0)
-        discard;
+	if (alpha < 1.0/255.0)
+		discard;
 
-    half3 finalColor = i.col.rgb;
+	float4 tint = _GlobalTint;
+	half3 finalColor = i.col.rgb * (half3)tint.rgb;
+	half tintAlpha = saturate((half)tint.a);
 
-    if (_GaussianShadowEnabled > 0.5)
-    {
-        half visibility = SamplePointShadow(i.worldPos);
-	    half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility);
-        finalColor *= lightIntensity;
-    }
+	if (_GaussianShadowEnabled > 0.5)
+	{
+		half visibility = SamplePointShadow(i.worldPos);
+		half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility);
+		finalColor *= lightIntensity;
+	}
 
-    half4 res = half4(finalColor * alpha, alpha);
-    return res;
+	half4 res = half4(finalColor * alpha, alpha * tintAlpha);
+	return res;
 }
 ENDCG
         }

@@ -147,6 +147,11 @@ namespace GaussianSplatting.Runtime
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
+                if (displayMat == gs.m_MatSplats)
+                {
+                    var tint = gs.m_TintEnabled ? gs.m_GlobalTint : Color.white;
+                    mpb.SetColor(GaussianSplatRenderer.Props.GlobalTint, tint);
+                }
 
                 cmb.BeginSample(s_ProfCalcView);
                 gs.CalcViewData(cmb, cam);
@@ -240,6 +245,10 @@ namespace GaussianSplatting.Runtime
 
         public RenderMode m_RenderMode = RenderMode.Splats;
         [Range(1.0f,15.0f)] public float m_PointDisplaySize = 3.0f;
+        [ColorUsage(false, true)] [Tooltip("Tint applied to the splats after shading.")]
+        public Color m_GlobalTint = Color.white;
+        [Tooltip("Whether the global tint override is applied.")]
+        public bool m_TintEnabled = true;
 
         public GaussianCutout[] m_Cutouts;
 
@@ -311,6 +320,7 @@ namespace GaussianSplatting.Runtime
             public static readonly int GaussianSplatRT = Shader.PropertyToID("_GaussianSplatRT");
             public static readonly int SplatSortKeys = Shader.PropertyToID("_SplatSortKeys");
             public static readonly int SplatSortDistances = Shader.PropertyToID("_SplatSortDistances");
+            public static readonly int GlobalTint = Shader.PropertyToID("_GlobalTint");
             public static readonly int SrcBuffer = Shader.PropertyToID("_SrcBuffer");
             public static readonly int DstBuffer = Shader.PropertyToID("_DstBuffer");
             public static readonly int BufferSize = Shader.PropertyToID("_BufferSize");
@@ -481,6 +491,26 @@ namespace GaussianSplatting.Runtime
                 m_Registered = true;
             }
         }
+
+        public void SetGlobalTint(Color color)
+        {
+            m_GlobalTint = color;
+        }
+
+        public void EnableGlobalTint(bool enabled)
+        {
+            m_TintEnabled = enabled;
+        }
+
+        public void ApplyGlobalTint(Color color, bool enabled)
+        {
+            m_GlobalTint = color;
+            m_TintEnabled = enabled;
+        }
+
+        public Color GetGlobalTint() => m_GlobalTint;
+
+        public bool IsGlobalTintEnabled() => m_TintEnabled;
 
         public void OnEnable()
         {
