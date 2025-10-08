@@ -75,6 +75,7 @@ namespace GaussianSplatting.Runtime
         
         private static readonly int s_LightBrightnessID_Main = Shader.PropertyToID("_LightBrightness");
         private static readonly int s_ShadowBrightnessID_Main = Shader.PropertyToID("_ShadowBrightness");
+        private static readonly int s_ShadowEnabledID_Main = Shader.PropertyToID("_GaussianShadowEnabled");
 
         private ComputeShader m_SplatUtilitiesCS;
         private GraphicsBuffer m_LightViewDataBuffer;
@@ -128,6 +129,7 @@ namespace GaussianSplatting.Runtime
         void OnDisable()
         {
             CleanupResources();
+            Shader.SetGlobalFloat(s_ShadowEnabledID_Main, 0f);
         }
         
         public void MarkShadowsDirty()
@@ -212,6 +214,12 @@ namespace GaussianSplatting.Runtime
             if (shadowCubemap == null)
             {
                 Debug.LogError("RenderShadowFacesURP: 큐브맵 RenderTexture가 준비되지 않았습니다.", this);
+                return;
+            }
+
+            if (!pointLightTransform)
+            {
+                cmd.SetGlobalFloat(s_ShadowEnabledID_Main, 0f);
                 return;
             }
             
@@ -309,21 +317,40 @@ namespace GaussianSplatting.Runtime
             return GraphicsSettings.currentRenderPipeline is UniversalRenderPipelineAsset;
         }
 
-        public void SetGlobalShadowParameters()
+        public bool SetGlobalShadowParameters(CommandBuffer cmd = null)
         {
-            // 셰이더 전역 변수를 설정하므로 특정 머티리얼이 필요하지 않음
-            // if (!m_GaussianSplatRenderer || !m_GaussianSplatRenderer.m_MatSplats || !pointLightTransform) return;
-            if (!pointLightTransform) return;
+            void SetFloat(int id, float value)
+            {
+                if (cmd != null)
+                    cmd.SetGlobalFloat(id, value);
+                else
+                    Shader.SetGlobalFloat(id, value);
+            }
 
-            // 1. 기존 파라미터 설정
-            Shader.SetGlobalVector(s_PointLightPositionID_Main, pointLightTransform.position);
-            Shader.SetGlobalFloat(s_ShadowBiasID_Main, shadowBias);
-            Shader.SetGlobalFloat(s_LightFarPlaneID_Main, lightFarPlane);
-            Shader.SetGlobalFloat(s_LightNearPlaneID_Main, lightNearPlane);
-            
-            Shader.SetGlobalFloat(s_LightBrightnessID_Main, lightBrightness);
-            Shader.SetGlobalFloat(s_ShadowBrightnessID_Main, shadowBrightness);
-            
+            void SetVector(int id, Vector4 value)
+            {
+                if (cmd != null)
+                    cmd.SetGlobalVector(id, value);
+                else
+                    Shader.SetGlobalVector(id, value);
+            }
+
+            if (!pointLightTransform || !HasValidShadowCubemap)
+            {
+                SetFloat(s_ShadowEnabledID_Main, 0f);
+                return false;
+            }
+
+            SetFloat(s_ShadowEnabledID_Main, 1f);
+
+            SetVector(s_PointLightPositionID_Main, pointLightTransform.position);
+            SetFloat(s_ShadowBiasID_Main, shadowBias);
+            SetFloat(s_LightFarPlaneID_Main, lightFarPlane);
+            SetFloat(s_LightNearPlaneID_Main, lightNearPlane);
+
+            SetFloat(s_LightBrightnessID_Main, lightBrightness);
+            SetFloat(s_ShadowBrightnessID_Main, shadowBrightness);
+
             // 2. _LightZBufferParams 계산 및 설정
             Vector4 zBufferParams;
             float near = lightNearPlane;
@@ -347,7 +374,8 @@ namespace GaussianSplatting.Runtime
                 zBufferParams.w = zBufferParams.y / far;
             }
 
-            Shader.SetGlobalVector(s_LightZBufferParamsID_Main, zBufferParams);
+            SetVector(s_LightZBufferParamsID_Main, zBufferParams);
+            return true;
         }
         
         private bool HasSettingsChanged()

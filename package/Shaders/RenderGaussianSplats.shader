@@ -45,6 +45,7 @@ float4 _LightZBufferParams;
 
 float _LightBrightness;        // 빛을 받는 영역의 밝기
 float _ShadowBrightness;       // 그림자 영역의 밝기
+float _GaussianShadowEnabled;  // 그림자 사용 여부 (0: 미사용)
 
 // --- 점광원 그림자 계산 함수 ---
 bool SamplePointShadow(float3 worldPos)
@@ -139,10 +140,15 @@ half4 frag (v2f i) : SV_Target
     if (alpha < 1.0/255.0)
         discard;
 
-    half visibility = SamplePointShadow(i.worldPos);
-	half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility);
-    half3 finalColor = i.col.rgb * lightIntensity;
-    
+    half3 finalColor = i.col.rgb;
+
+    if (_GaussianShadowEnabled > 0.5)
+    {
+        half visibility = SamplePointShadow(i.worldPos);
+	    half lightIntensity = lerp(_ShadowBrightness, _LightBrightness, visibility);
+        finalColor *= lightIntensity;
+    }
+
     half4 res = half4(finalColor * alpha, alpha);
     return res;
 }

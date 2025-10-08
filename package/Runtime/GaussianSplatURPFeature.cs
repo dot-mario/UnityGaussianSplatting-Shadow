@@ -74,8 +74,11 @@ namespace GaussianSplatting.Runtime
                         {
                             return;
                         }
-                        cmd.SetGlobalTexture(s_ShadowCubemap, cubemap);
-                        data.ShadowRenderer.SetGlobalShadowParameters();
+                        bool shadowActive = data.ShadowRenderer.SetGlobalShadowParameters(cmd);
+                        if (shadowActive)
+                        {
+                            cmd.SetGlobalTexture(s_ShadowCubemap, cubemap);
+                        }
                     });
                 }
                 
